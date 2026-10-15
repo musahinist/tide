@@ -19,6 +19,7 @@ const ICONS = {
   pause: '<path d="M5.5 3.5v9M10.5 3.5v9"/>',
   resume: '<path d="M8 2.5v9M4 7.5l4 4 4-4M3.5 13.5h9"/>',
   remove: '<path d="M4 4l8 8M12 4l-8 8"/>',
+  more: '<path class="fill" d="M3 8a1.2 1.2 0 1 0 2.4 0A1.2 1.2 0 0 0 3 8zm3.8 0a1.2 1.2 0 1 0 2.4 0 1.2 1.2 0 0 0-2.4 0zm3.8 0a1.2 1.2 0 1 0 2.4 0 1.2 1.2 0 0 0-2.4 0z"/>',
   folder: '<path d="M2 4.5c0-.6.4-1 1-1h3.2l1.5 1.5H13c.6 0 1 .4 1 1v6c0 .6-.4 1-1 1H3c-.6 0-1-.4-1-1z"/>',
 };
 const svg = (name) => `<svg viewBox="0 0 16 16">${ICONS[name]}</svg>`;
@@ -55,12 +56,7 @@ function statsLine(t) {
     case 'error': return t.error || 'Error';
     case 'paused': return t.total_bytes ? `Paused · ${pct(t.progress)} · ${bytes(t.progress_bytes)} of ${bytes(t.total_bytes)}` : 'Paused';
     case 'initializing': return `Checking files… ${pct(t.progress)}`;
-    case 'seeding': {
-      const parts = [`Done · ${bytes(t.total_bytes)}`];
-      if (t.up_bps > 0) parts.push(`↑ ${speed(t.up_bps)}`);
-      if (t.peers) parts.push(plural(t.peers, 'peer'));
-      return parts.join(' · ');
-    }
+    case 'completed': return `Completed · ${bytes(t.total_bytes)}`;
     default: {
       const parts = [pct(t.progress), `${bytes(t.progress_bytes)} of ${bytes(t.total_bytes)}`, `↓ ${speed(t.down_bps)}`];
       if (t.up_bps > 1000) parts.push(`↑ ${speed(t.up_bps)}`);
@@ -135,7 +131,8 @@ $('add').addEventListener('submit', async (e) => {
 
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
-  if (!$('modal').hidden) closeConfirm();
+  if (!menu.hidden) closeMenu();
+  else if (!$('modal').hidden) closeConfirm();
   else if (document.body.classList.contains('adding')) closeAdd();
   else if (openKey) closePanel();
 });
@@ -178,14 +175,22 @@ $('confirm').addEventListener('submit', (e) => {
 
 // ---------- playback ----------
 const play = (key, fileIndex) =>
-  invoke('play_media', { media: { kind: 'torrent', key, fileIndex } }).catch(reportError);
+  invoke('play_media', { media: { kind: 'torrent', key, fileIndex } }).catch(playError);
+function playError(e) {
+  if (errCode(e) === 'NOT_READY') toast('Still checking files…'); else reportError(e);
+}
+// Resume refuses finished torrents ("COMPLETED: …"); that is not worth a toast.
+const resumeT = (key) => invoke('resume_torrent', { key }).then(refresh, (e) => (errCode(e) === 'COMPLETED' ? refresh() : reportError(e)));
+const pauseT = (key) => invoke('pause_torrent', { key }).then(refresh, reportError);
 
 async function playLargest(key) {
   try {
     const media = (await invoke('list_files', { key })).filter((f) => f.kind === 'video' || f.kind === 'audio');
     if (!media.length) return toast('No video or audio in this torrent');
-    play(key, media.reduce((a, b) => (b.size > a.size ? b : a)).index);
-  } catch (e) { reportError(e); }
+    const f = media.reduce((a, b) => (b.size > a.size ? b : a));
+    mainFile.set(key, f.index);
+    play(key, f.index);
+  } catch (e) { playError(e); }
 }
 
 // ---------- rows (diffed by key) ----------
@@ -230,13 +235,17 @@ function createRow(key) {
   const r = { el, head, name, statsText, fill, panel: null, details: null, last: null, artPri: 0 };
   const ctl = h('div', 'ctl');
   r.playBtn = iconBtn('play', 'Play', () => playLargest(key));
-  r.pauseBtn = iconBtn('pause', 'Pause', () => invoke('pause_torrent', { key }).then(refresh, reportError));
-  r.resumeBtn = iconBtn('resume', 'Resume', () => invoke('resume_torrent', { key }).then(refresh, reportError));
+  r.pauseBtn = iconBtn('pause', 'Pause', () => pauseT(key));
+  r.resumeBtn = iconBtn('resume', 'Resume', () => resumeT(key));
   r.revealBtn = iconBtn('folder', 'Show in Finder', () => invoke('reveal_torrent', { key }).catch(reportError));
-  ctl.append(r.playBtn, r.pauseBtn, r.resumeBtn, r.revealBtn, iconBtn('remove', 'Remove', () => askRemove(r.last)));
+  r.moreBtn = iconBtn('more', 'More', () => openMenu(r.moreBtn, { key }));
+  ctl.append(r.playBtn, r.pauseBtn, r.resumeBtn, r.revealBtn, iconBtn('remove', 'Remove', () => askRemove(r.last)), r.moreBtn);
 
   r.art = h('div', 'art');
-  head.append(r.art, name, stats, ctl, bar);
+  r.check = h('button', 'wcheck', '✓');
+  r.check.type = 'button';
+  r.check.addEventListener('click', (e) => { e.stopPropagation(); toggleWatched(key); });
+  head.append(r.art, r.check, name, stats, ctl, bar);
   head.addEventListener('click', () => toggle(key));
   el.append(head);
   return r;
@@ -245,10 +254,13 @@ function createRow(key) {
 function updateRow(r, t) {
   const p = r.last || {};
   const m = infoOf(t.key);
-  const title = mediaTitle(t, m);
+  const title = r.group ? episodeTitle(t, m) : mediaTitle(t, m);
+  const w0 = isWatched(t.key);
+  if (r.watched !== w0) { r.watched = w0; r.check.classList.toggle('on', w0); r.check.title = w0 ? 'Watched — click to unmark' : 'Mark as watched'; }
   if (r.name.textContent !== title) r.name.textContent = title;
   if (p.name !== t.name) r.name.title = t.name;
-  if (p.state !== t.state) r.el.className = `torrent s-${t.state}${t.key === openKey ? ' open' : ''}`;
+  const cls = `torrent s-${t.state}${t.key === openKey ? ' open' : ''}${r.group ? ' ep' : ''}`;
+  if (r.el.className !== cls) r.el.className = cls;
   const rt = rating(m);
   const line = statsLine(t) + (rt ? ` · IMDb ${rt}` : '');
   if (r.statsText.textContent !== line) r.statsText.textContent = line;
@@ -256,8 +268,8 @@ function updateRow(r, t) {
   if (r.fill.style.width !== w) r.fill.style.width = w;
 
   const ready = t.state !== 'resolving' && t.id != null;
-  r.playBtn.hidden = !ready || t.state === 'error';
-  r.pauseBtn.hidden = !(t.state === 'downloading' || t.state === 'seeding' || t.state === 'initializing');
+  r.playBtn.hidden = !ready || t.state === 'error' || t.state === 'initializing';
+  r.pauseBtn.hidden = !(t.state === 'downloading' || t.state === 'initializing');
   r.resumeBtn.hidden = !(t.state === 'paused' || (t.state === 'error' && ready));
   r.revealBtn.hidden = !t.output_path;
   r.last = t;
@@ -265,18 +277,107 @@ function updateRow(r, t) {
   wantMeta(t);
 }
 
+// ---------- groups (computed here; the backend only persists groups.json / watched.json) ----------
+let groupsData = { groups: [], excluded: {} };
+let watched = {}; // "key:fileIndex" -> true
+let watchedKeys = new Set(); // torrent keys with any watched file
+const mainFile = new Map(); // key -> index of the main media file (largest video/audio)
+const groupEls = new Map(); // gid -> group card
+const expanded = new Set(); // gids of expanded group cards (survives re-renders)
+let lastList = [];
+let lastGroups = new Map(); // gid -> { gid, id, name, keys, autoKey }
+
+const code = (s, e) => `S${pad2(s)}E${pad2(e)}`;
+const normTitle = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+function parseSE(name) {
+  const m = /^(.*?)[\s._-]+s(\d{1,2})[\s._-]?e(\d{1,3})/i.exec(name) || /^(.*?)[\s._-]+(\d{1,2})x(\d{2,3})\b/i.exec(name);
+  return m && m[1] ? { show: m[1].replace(/[._]+/g, ' ').trim(), season: +m[2], episode: +m[3] } : null;
+}
+// Episode facts for a row: { autoKey, show, season, episode, title } or null.
+function epInfo(t) {
+  const m = infoOf(t.key);
+  if (matched(m) && m.media_type === 'tv') {
+    return { autoKey: m.imdb_id ? `imdb:${m.imdb_id}` : null, show: m.title, season: m.season, episode: m.episode, title: m.episode_title };
+  }
+  const p = parseSE(t.name);
+  if (!p) return null;
+  return { autoKey: matched(m) ? null : `title:${normTitle(p.show)}`, show: p.show, season: p.season, episode: p.episode, title: null };
+}
+function episodeTitle(t) {
+  const e = epInfo(t);
+  if (!e || e.season == null || e.episode == null) return t.name;
+  return e.title ? `${code(e.season, e.episode)} · ${e.title}` : code(e.season, e.episode);
+}
+
+const isWatched = (key) => (mainFile.has(key) ? !!watched[`${key}:${mainFile.get(key)}`] : watchedKeys.has(key));
+const playable = (t) => t.id != null && !['resolving', 'initializing', 'error'].includes(t.state);
+
+function computeGroups(list) {
+  const byKey = new Map(list.map((t) => [t.key, t]));
+  const out = new Map();
+  const owner = new Map();
+  const autoInto = new Map(); // auto key -> manual gid that already holds an episode of that show
+  for (const g of groupsData.groups) {
+    const gid = `g:${g.id}`;
+    out.set(gid, { gid, id: g.id, name: g.name, keys: [] });
+    if (g.auto_key) autoInto.set(g.auto_key, gid);
+    for (const k of g.members) {
+      const t = byKey.get(k);
+      if (!t || owner.has(k)) continue;
+      owner.set(k, gid);
+      const e = epInfo(t);
+      if (e && e.autoKey && !autoInto.has(e.autoKey)) autoInto.set(e.autoKey, gid);
+    }
+  }
+  const autos = new Map();
+  for (const t of list) {
+    if (owner.has(t.key) || groupsData.excluded[t.key]) continue;
+    const e = epInfo(t);
+    if (!e || !e.autoKey) continue;
+    if (!autos.has(e.autoKey)) autos.set(e.autoKey, { name: e.show, keys: [] });
+    autos.get(e.autoKey).keys.push(t.key);
+  }
+  for (const [ak, a] of autos) {
+    const into = autoInto.get(ak);
+    if (into) { a.keys.forEach((k) => owner.set(k, into)); continue; }
+    if (a.keys.length < 2) continue;
+    const gid = `a:${ak}`;
+    out.set(gid, { gid, id: null, name: a.name, keys: [], autoKey: ak });
+    a.keys.forEach((k) => owner.set(k, gid));
+  }
+  for (const t of list) { const g = owner.get(t.key); if (g) out.get(g).keys.push(t.key); }
+  return { groups: out, owner };
+}
+
 function render(list) {
+  lastList = list;
+  const { groups, owner } = computeGroups(list);
+  lastGroups = groups;
   const seen = new Set();
-  const container = $('list');
-  let prev = null;
   for (const t of list) {
     seen.add(t.key);
     let r = rows.get(t.key);
     if (!r) { r = createRow(t.key); rows.set(t.key, r); }
+    r.group = owner.get(t.key) || null;
     updateRow(r, t);
+  }
+  const container = $('list');
+  const seenG = new Set();
+  let prev = null;
+  const place = (el) => {
     const want = prev ? prev.nextSibling : container.firstChild;
-    if (want !== r.el) container.insertBefore(r.el, want);
-    prev = r.el;
+    if (want !== el) container.insertBefore(el, want);
+    prev = el;
+  };
+  for (const t of list) {
+    const r = rows.get(t.key);
+    if (!r.group) { place(r.el); continue; }
+    if (seenG.has(r.group)) continue;
+    seenG.add(r.group);
+    let G = groupEls.get(r.group);
+    if (!G) { G = createGroup(r.group); groupEls.set(r.group, G); }
+    updateGroup(G, groups.get(r.group));
+    place(G.el);
   }
   for (const [key, r] of rows) {
     if (!seen.has(key)) {
@@ -284,10 +385,238 @@ function render(list) {
       if (openKey === key) openKey = null;
     }
   }
+  for (const [gid, G] of groupEls) if (!seenG.has(gid)) { G.el.remove(); groupEls.delete(gid); }
   pumpArtwork();
   pumpMeta();
   $('empty').hidden = list.length > 0;
   if (openKey) updatePanel(openKey);
+}
+
+function createGroup(gid) {
+  const G = { gid, el: h('section', 'torrent group'), head: h('div', 'head'), name: h('div', 'name'), seasons: new Map() };
+  const stats = h('div', 'stats');
+  G.statsText = h('span');
+  stats.append(h('span', 'dot'), G.statsText);
+  const bar = h('div', 'bar');
+  G.fill = h('i');
+  bar.append(G.fill);
+  G.art = h('div', 'art');
+  const ctl = h('div', 'gctl');
+  G.nextBtn = h('button', 'gnext');
+  G.nextBtn.type = 'button';
+  G.nextBtn.addEventListener('click', (e) => { e.stopPropagation(); if (G.nextKey) playLargest(G.nextKey); });
+  const more = iconBtn('more', 'More', () => openMenu(more, { gid }));
+  more.classList.add('gmore');
+  ctl.append(G.nextBtn, more);
+  G.head.append(G.art, G.name, stats, ctl, bar);
+  G.head.addEventListener('click', () => {
+    if (expanded.has(gid)) expanded.delete(gid); else expanded.add(gid);
+    render(lastList);
+  });
+  G.eps = h('div', 'eps');
+  G.el.append(G.head, G.eps);
+  return G;
+}
+
+function updateGroup(G, gr) {
+  const items = gr.keys.map((k) => ({ r: rows.get(k), t: rows.get(k).last, e: epInfo(rows.get(k).last) || {} }));
+  const num = (v) => (v == null ? 1e9 : v);
+  items.sort((a, b) => num(a.e.season) - num(b.e.season) || num(a.e.episode) - num(b.e.episode) || a.t.name.localeCompare(b.t.name));
+  const first = items.find((x) => x.e.season != null && x.e.episode != null);
+  const last = [...items].reverse().find((x) => x.e.season != null && x.e.episode != null);
+  let name = gr.name;
+  if (!gr.id) { const m = items.map((x) => infoOf(x.t.key)).find(matched); if (m) name = m.title; }
+  if (G.name.textContent !== name) G.name.textContent = name;
+
+  let total = 0, done = 0, down = 0;
+  for (const { t } of items) { total += t.total_bytes; done += t.progress_bytes; down += t.down_bps; }
+  const allDone = items.every((x) => x.t.state === 'completed');
+  const parts = [plural(items.length, 'episode')];
+  if (first) parts.push(first === last ? code(first.e.season, first.e.episode) : `${code(first.e.season, first.e.episode)}–${code(last.e.season, last.e.episode)}`);
+  parts.push(bytes(total));
+  if (!allDone && total) parts.push(pct(done / total));
+  if (down > 0) parts.push(`↓ ${speed(down)}`);
+  const line = parts.join(' · ');
+  if (G.statsText.textContent !== line) G.statsText.textContent = line;
+  const w = `${(total ? (done / total) * 100 : 0).toFixed(2)}%`;
+  if (G.fill.style.width !== w) G.fill.style.width = w;
+  const st = allDone ? 'completed' : items.some((x) => x.t.state === 'downloading') ? 'downloading' : items.some((x) => x.t.state === 'error') ? 'error' : 'paused';
+  const open = expanded.has(G.gid);
+  const cls = `torrent group s-${st}${open ? ' expanded' : ''}`;
+  if (G.el.className !== cls) G.el.className = cls;
+
+  const next = items.find((x) => playable(x.t) && !isWatched(x.t.key)) || items.find((x) => playable(x.t));
+  G.nextKey = next ? next.t.key : null;
+  const label = next ? `▶ ${next.e.season != null && next.e.episode != null ? code(next.e.season, next.e.episode) : 'Play'}` : '';
+  if (G.nextBtn.textContent !== label) G.nextBtn.textContent = label;
+  G.nextBtn.hidden = !next;
+
+  const withArt = items.find((x) => x.r.artUrl);
+  const url = withArt ? withArt.r.artUrl : null;
+  if (url && G.artUrl !== url) {
+    G.artUrl = url;
+    G.art.style.backgroundImage = `url("${url}")`;
+    const img = new Image();
+    img.className = 'thumb';
+    img.alt = '';
+    img.draggable = false;
+    img.src = url;
+    if (G.thumb) G.thumb.replaceWith(img); else G.head.insertBefore(img, G.name);
+    G.thumb = img;
+    G.head.classList.add('has-art');
+    requestAnimationFrame(() => requestAnimationFrame(() => G.head.classList.add('art-on')));
+  }
+
+  // Episode list: season headers + the rows themselves (kept inside even when collapsed).
+  G.eps.hidden = !open;
+  const want = [];
+  const seasons = new Set(items.map((x) => x.e.season));
+  const showHeaders = seasons.size > 1 || !seasons.has(undefined);
+  let cur;
+  for (const x of items) {
+    if (showHeaders && x.e.season !== cur) {
+      cur = x.e.season;
+      const label = cur == null ? 'Other' : cur === 0 ? 'Specials' : `Season ${cur}`;
+      if (!G.seasons.has(label)) G.seasons.set(label, h('div', 'season', label));
+      want.push(G.seasons.get(label));
+    }
+    want.push(x.r.el);
+  }
+  want.forEach((el, i) => { if (G.eps.children[i] !== el) G.eps.insertBefore(el, G.eps.children[i] || null); });
+  while (G.eps.children.length > want.length) G.eps.lastChild.remove();
+}
+
+// ---------- groups/watched persistence ----------
+function reloadGroups() {
+  return invoke('list_groups').then((g) => { groupsData = { groups: (g && g.groups) || [], excluded: (g && g.excluded) || {} }; render(lastList); }, () => {});
+}
+function reloadWatched() {
+  return invoke('get_watched').then((w) => {
+    watched = w || {};
+    watchedKeys = new Set(Object.keys(watched).filter((k) => watched[k]).map((k) => k.slice(0, k.lastIndexOf(':'))));
+    render(lastList);
+  }, () => {});
+}
+async function mainIndex(key) {
+  if (mainFile.has(key)) return mainFile.get(key);
+  const media = (await invoke('list_files', { key })).filter((f) => f.kind === 'video' || f.kind === 'audio');
+  if (!media.length) throw 'NOT_FOUND: no video or audio in this torrent';
+  const idx = media.reduce((a, b) => (b.size > a.size ? b : a)).index;
+  mainFile.set(key, idx);
+  return idx;
+}
+async function toggleWatched(key) {
+  try {
+    const on = !isWatched(key);
+    if (on) await invoke('set_watched', { key, fileIndex: await mainIndex(key), watched: true });
+    else {
+      for (const k of Object.keys(watched)) {
+        if (k.startsWith(`${key}:`)) await invoke('set_watched', { key, fileIndex: Number(k.slice(key.length + 1)), watched: false });
+      }
+    }
+    await reloadWatched();
+  } catch (e) { playError(e); }
+}
+
+// The player keeps "tide:resume:<key>:<fileIndex>" = seconds in localStorage and drops it
+// once ≥ 90 % is watched. Either signal marks the file watched (once).
+const marked = new Set();
+function markWatched(key, idx) {
+  const k = `${key}:${idx}`;
+  if (watched[k] || marked.has(k)) return;
+  marked.add(k);
+  invoke('set_watched', { key, fileIndex: idx, watched: true }).then(reloadWatched, () => marked.delete(k));
+}
+const RESUME_RE = /^tide:resume:([0-9a-f]{40}):(\d+)$/;
+function scanResume() {
+  let ls;
+  try { ls = window.localStorage; } catch { return; }
+  for (let i = 0; i < ls.length; i++) {
+    const m = RESUME_RE.exec(ls.key(i) || '');
+    if (!m) continue;
+    const secs = parseFloat(ls.getItem(m[0]));
+    const info = infoOf(m[1]);
+    const dur = info && info.runtime_min ? info.runtime_min * 60 : 0;
+    if (dur && secs >= 0.9 * dur) markWatched(m[1], Number(m[2]));
+  }
+}
+window.addEventListener('storage', (e) => {
+  const m = RESUME_RE.exec(e.key || '');
+  if (m && e.oldValue != null && e.newValue == null && parseFloat(e.oldValue) >= 60) markWatched(m[1], Number(m[2]));
+});
+setInterval(scanResume, 5000);
+window.addEventListener('focus', () => { scanResume(); reloadWatched(); });
+
+// ---------- ⋯ menu ----------
+const menu = h('div', 'menu');
+menu.hidden = true;
+document.body.append(menu);
+let menuCtx = null;
+function closeMenu() { menu.hidden = true; menuCtx = null; }
+document.addEventListener('mousedown', (e) => { if (!menu.hidden && !menu.contains(e.target)) closeMenu(); });
+$('list').addEventListener('scroll', closeMenu);
+
+function menuItem(text, run, cls) {
+  const b = h('button', `mi${cls ? ` ${cls}` : ''}`, text);
+  b.type = 'button';
+  b.addEventListener('click', (e) => { e.stopPropagation(); run(); });
+  return b;
+}
+function menuInput(value, placeholder, done) {
+  const f = h('form', 'mform');
+  const i = h('input');
+  i.type = 'text';
+  i.spellcheck = false;
+  i.value = value || '';
+  i.placeholder = placeholder;
+  f.append(i);
+  f.addEventListener('submit', (e) => { e.preventDefault(); const v = i.value.trim(); if (v) { closeMenu(); done(v); } });
+  i.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.stopPropagation(); closeMenu(); } });
+  menu.replaceChildren(f);
+  i.focus();
+  i.select();
+}
+const act = (p) => Promise.resolve(p).then(reloadGroups, reportError);
+
+function openMenu(anchor, ctx) {
+  menuCtx = ctx;
+  const items = [];
+  if (ctx.key) {
+    const key = ctx.key, gid = rows.get(key) && rows.get(key).group;
+    items.push(menuItem('Add to group…', () => groupPicker(key, gid)));
+    if (gid) items.push(menuItem('Remove from group', () => { closeMenu(); act(invoke('remove_from_group', { key })); }));
+  } else {
+    const gr = lastGroups.get(ctx.gid);
+    if (!gr) return;
+    items.push(menuItem('Rename group', () => menuInput(gr.name, 'Group name', (name) => act(gr.id
+      ? invoke('rename_group', { id: gr.id, name })
+      : invoke('create_group', { name, keys: gr.keys })))));
+    items.push(menuItem('Ungroup', () => { closeMenu(); act(ungroup(gr)); }));
+  }
+  menu.replaceChildren(...items);
+  menu.hidden = false;
+  const a = anchor.getBoundingClientRect();
+  menu.style.top = `${Math.min(a.bottom + 4, innerHeight - menu.offsetHeight - 8)}px`;
+  menu.style.left = `${Math.max(8, a.right - menu.offsetWidth)}px`;
+}
+
+function groupPicker(key, current) {
+  const items = [];
+  for (const gr of lastGroups.values()) {
+    if (gr.gid === current) continue;
+    items.push(menuItem(gr.name, () => {
+      closeMenu();
+      act(gr.id ? invoke('add_to_group', { id: gr.id, key }) : invoke('create_group', { name: gr.name, keys: [...gr.keys, key] }));
+    }));
+  }
+  items.push(menuItem('New group…', () => menuInput('', 'Group name', (name) => act(invoke('create_group', { name, keys: [key] }))), 'new'));
+  menu.replaceChildren(...items);
+}
+
+async function ungroup(gr) {
+  for (const key of gr.keys) await invoke('remove_from_group', { key });
+  if (gr.id) await invoke('delete_group', { id: gr.id });
+  expanded.delete(gr.gid);
 }
 
 // ---------- artwork ----------
@@ -332,6 +661,7 @@ function showArtwork(key, url, kind, pri) {
   img.onload = () => {
     if (rows.get(key) !== r || r.artPri > pri) return;
     r.artPri = pri;
+    r.artUrl = url;
     r.art.style.backgroundImage = `url("${url}")`;
     if (r.thumb) r.thumb.replaceWith(img); else r.head.classList.add('has-art');
     r.head.insertBefore(img, r.name);
@@ -448,6 +778,7 @@ function buildPanel(key) {
 
 function torrentStats(t) {
   if (t.state === 'resolving') return 'Getting metadata…';
+  if (t.state === 'completed') return `${bytes(t.total_bytes)} · Completed`;
   const parts = [bytes(t.total_bytes), `${pct(t.progress)} · ${bytes(t.progress_bytes)} / ${bytes(t.total_bytes)}`,
     `↓ ${speed(t.down_bps)}`, `↑ ${speed(t.up_bps)}`, plural(t.peers, 'peer')];
   if (t.progress_bytes > 0) parts.push(`ratio ${(t.uploaded_bytes / t.progress_bytes).toFixed(2)}`);
@@ -642,12 +973,15 @@ var MOCK = T ? null : (() => {
   const empty = location.hash.includes('empty');
   const list = empty ? [] : [
     mk(1, 'Big Buck Bunny (2008) 1080p', 'downloading', 4.2 * GB, 0.45, { down_bps: 2.1 * MB, up_bps: 140e3, peers: 12 }),
-    mk(2, 'Sintel.2010.2160p.mkv', 'seeding', 3.9 * GB, 1, { up_bps: 320e3, peers: 4 }),
+    mk(2, 'Sintel.2010.2160p.mkv', 'completed', 3.9 * GB, 1),
     mk(3, 'ubuntu-24.04.1-desktop-amd64.iso', 'paused', 6.1 * GB, 0.18),
     mk(4, 'Tears of Steel', 'resolving', 0, 0),
     mk(5, 'Cosmos Laundromat – First Cycle', 'error', 1.6 * GB, 0.07, { error: 'Tracker unreachable: connection timed out' }),
     mk(6, 'The Daily Podcast – Season 3 Complete', 'downloading', 812 * MB, 0.83, { down_bps: 640e3, peers: 31 }),
     mk(7, 'Severance.S02E05.1080p.ATVP.WEB-DL.DDP5.1.H.264-NTb', 'downloading', 2.4 * GB, 0.62, { down_bps: 3.4 * MB, up_bps: 90e3, peers: 22, uploaded_bytes: 310 * MB }),
+    mk(8, 'The.Lighthouse.Keepers.S01E01.1080p.WEB-DL', 'completed', 1.4 * GB, 1),
+    mk(9, 'The.Lighthouse.Keepers.S01E02.1080p.WEB-DL', 'completed', 1.5 * GB, 1),
+    mk(10, 'The.Lighthouse.Keepers.S01E03.1080p.WEB-DL', 'downloading', 1.5 * GB, 0.38, { down_bps: 1.8 * MB, peers: 17 }),
   ];
   const files = {
     [hash(1)]: [['Big Buck Bunny.mp4', 'video', 4.1 * GB], ['Big Buck Bunny.en.srt', 'subtitle', 48e3], ['Big Buck Bunny.tr.srt', 'subtitle', 51e3], ['poster.jpg', 'other', 820e3]],
@@ -655,9 +989,16 @@ var MOCK = T ? null : (() => {
     [hash(3)]: [['ubuntu-24.04.1-desktop-amd64.iso', 'other', 6.1 * GB]],
     [hash(5)]: [['Cosmos Laundromat.mkv', 'video', 1.6 * GB]],
     [hash(7)]: [['Severance.S02E05.1080p.mkv', 'video', 2.4 * GB], ['Severance.S02E05.en.srt', 'subtitle', 60e3]],
+    [hash(8)]: [['The.Lighthouse.Keepers.S01E01.mp4', 'video', 1.4 * GB]],
+    [hash(9)]: [['The.Lighthouse.Keepers.S01E02.mp4', 'video', 1.5 * GB]],
+    [hash(10)]: [['The.Lighthouse.Keepers.S01E03.mp4', 'video', 1.5 * GB]],
     [hash(6)]: Array.from({ length: 8 }, (_, i) => [`Season 3/Episode ${String(i + 1).padStart(2, '0')}.mp3`, 'audio', 101 * MB]),
   };
   const listeners = [];
+  const groupsFile = { groups: [], excluded: {} };
+  const watchedFile = { [`${hash(8)}:0`]: true };
+  let gseq = 0;
+  const detach = (key) => { groupsFile.groups.forEach((g) => { g.members = g.members.filter((k) => k !== key); }); delete groupsFile.excluded[key]; };
   const find = (key) => list.find((t) => t.key === key);
   const err = (s) => Promise.reject(s);
 
@@ -668,7 +1009,7 @@ var MOCK = T ? null : (() => {
       t.progress_bytes = Math.min(t.total_bytes, t.progress_bytes + t.down_bps);
       t.progress = t.progress_bytes / t.total_bytes;
       t.eta_secs = Math.round((t.total_bytes - t.progress_bytes) / t.down_bps);
-      if (t.progress >= 1) Object.assign(t, { state: 'seeding', down_bps: 0, eta_secs: null });
+      if (t.progress >= 1) Object.assign(t, { state: 'completed', down_bps: 0, up_bps: 0, peers: 0, eta_secs: null });
     }
     listeners.forEach((cb) => cb({ payload: list.map((t) => ({ ...t })) }));
   }, 1000);
@@ -686,7 +1027,7 @@ var MOCK = T ? null : (() => {
       return { key, name, already_exists: false };
     },
     pause_torrent: ({ key }) => { Object.assign(find(key), { state: 'paused', down_bps: 0, up_bps: 0, peers: 0, eta_secs: null }); return null; },
-    resume_torrent: ({ key }) => { const t = find(key); Object.assign(t, t.progress >= 1 ? { state: 'seeding' } : { state: 'downloading', down_bps: 1.2 * MB, peers: 9, error: null }); return null; },
+    resume_torrent: ({ key }) => { const t = find(key); if (t.progress >= 1) return err('COMPLETED: already finished'); Object.assign(t, { state: 'downloading', down_bps: 1.2 * MB, peers: 9, error: null }); return null; },
     remove_torrent: ({ key }) => { list.splice(list.indexOf(find(key)), 1); return null; },
     reveal_torrent: () => null,
     get_download_dir: () => '/Users/me/Downloads',
@@ -724,6 +1065,19 @@ var MOCK = T ? null : (() => {
       return MOCK_INFO[key];
     },
     clear_media_match: ({ key }) => { delete MOCK_INFO[key]; return null; },
+    list_groups: () => JSON.parse(JSON.stringify(groupsFile)),
+    create_group: ({ name, keys }) => {
+      keys.forEach(detach);
+      const g = { id: `g${++gseq}`, name, members: [...new Set(keys)] };
+      groupsFile.groups.push(g);
+      return { ...g };
+    },
+    rename_group: ({ id, name }) => { groupsFile.groups.find((g) => g.id === id).name = name; return null; },
+    add_to_group: ({ id, key }) => { detach(key); groupsFile.groups.find((g) => g.id === id).members.push(key); return null; },
+    remove_from_group: ({ key }) => { detach(key); groupsFile.excluded[key] = true; return null; },
+    delete_group: ({ id }) => { groupsFile.groups = groupsFile.groups.filter((g) => g.id !== id); return null; },
+    get_watched: () => ({ ...watchedFile }),
+    set_watched: ({ key, fileIndex, watched: w }) => { if (w) watchedFile[`${key}:${fileIndex}`] = true; else delete watchedFile[`${key}:${fileIndex}`]; return null; },
     get_torrent_details: ({ key }) => ({ info_hash: key, magnet: `magnet:?xt=urn:btih:${key}&dn=${encodeURIComponent(find(key).name)}`, trackers: 7, save_path: find(key).output_path }),
   };
 
@@ -752,13 +1106,19 @@ var MOCK = T ? null : (() => {
       genres: ['Drama', 'Mystery', 'Sci-Fi'], runtime_min: 50, imdb_rating: 8.7,
       overview: 'Mark leads a team of office workers whose memories have been surgically divided between their work and personal lives.',
       episode_overview: 'Mark tries to reconnect with an old colleague while Helly questions who she can trust on the severed floor.' },
+    ...Object.fromEntries([[8, 'Lamp Oil'], [9, 'The Fog Bell'], [10, 'Low Tide']].map(([n, et], i) => [hash(n), { ...base, imdb_id: 'tt9000001',
+      media_type: 'tv', title: 'The Lighthouse Keepers', year: 2025, season: 1, episode: i + 1, episode_title: et, genres: ['Drama'], runtime_min: 45,
+      imdb_rating: 8.1, overview: 'Two keepers, one island, and a light that must never go out.' }])),
     [hash(2)]: { ...base, imdb_id: '', media_type: 'movie', title: 'Sintel', year: 2010, genres: [], runtime_min: null, imdb_rating: null, overview: '', needs_match: true },
   };
   const MOCK_RESULTS = [
     { ...base, imdb_id: 'tt1727587', media_type: 'movie', title: 'Sintel', year: 2010, release_info: '2010', genres: ['Animation', 'Fantasy'], runtime_min: 15, imdb_rating: 6.9, overview: 'A lonely young woman, Sintel, helps and befriends a dragon, whom she calls Scales.' },
     { ...base, imdb_id: 'tt0000002', media_type: 'movie', title: 'Sintel: The Making Of', year: 2011, release_info: '2011', genres: ['Documentary'], runtime_min: 40, imdb_rating: 7.1, overview: '' },
   ];
-  const MOCK_MEDIA_POSTERS = { [hash(1)]: MOCK_POSTERS[hash(1)], [hash(7)]: svgUrl(`<rect width="200" height="300" fill="#e9ecef"/><rect x="40" y="90" width="120" height="80" fill="#0b3d5c"/>
+  const LH = svgUrl(`<rect width="200" height="300" fill="#13243a"/><path d="M88 110h24l8 130H80z" fill="#e8e1d2"/><path d="M84 96h32v14H84z" fill="#f4c95d"/>
+      <path d="M100 103 L200 70 V136z" fill="#f4c95d" opacity=".35"/><path d="M0 240 Q100 225 200 240 V300 H0z" fill="#0a1626"/>
+      <text x="100" y="282" text-anchor="middle" font-family="Georgia" font-size="17" fill="#e8e1d2">THE LIGHTHOUSE KEEPERS</text>`);
+  const MOCK_MEDIA_POSTERS = { [hash(8)]: LH, [hash(9)]: LH, [hash(10)]: LH, [hash(1)]: MOCK_POSTERS[hash(1)], [hash(7)]: svgUrl(`<rect width="200" height="300" fill="#e9ecef"/><rect x="40" y="90" width="120" height="80" fill="#0b3d5c"/>
       <text x="100" y="250" text-anchor="middle" font-family="Helvetica" font-size="24" letter-spacing="4" fill="#0b3d5c">SEVERANCE</text>`) };
   MOCK_RESULTS[0].poster_url = MOCK_POSTERS[hash(2)];
   MOCK_RESULTS[1].poster_url = MOCK_POSTERS[hash(2)];
@@ -768,6 +1128,7 @@ var MOCK = T ? null : (() => {
     const f = location.hash;
     if (f.includes('open') || f.includes('movie')) toggle(hash(1));
     if (f.includes('tv')) toggle(hash(7));
+    if (f.includes('group')) { expanded.add('a:imdb:tt9000001'); render(list.map((t) => ({ ...t }))); }
     if (f.includes('adding')) { openAdd(); $('magnet').value = 'not a magnet'; setAddError('Not a magnet link'); }
     if (f.includes('confirm')) askRemove(list[0]);
     if (f.includes('toast')) reportError('VLC_NOT_FOUND: VLC is not installed');
@@ -785,3 +1146,5 @@ var MOCK = T ? null : (() => {
 // ---------- boot ----------
 listen('torrents-updated', (e) => render(e.payload));
 refresh();
+reloadGroups();
+reloadWatched();

@@ -33,6 +33,11 @@ type St<'a> = State<'a, Arc<AppState>>;
 
 pub const CINEMETA: &str = "https://v3-cinemeta.strem.io";
 const METAHUB: &str = "https://images.metahub.space";
+const IMDB_RATINGS: &str = "https://datasets.imdbws.com/title.ratings.tsv.gz";
+/// Re-download the IMDb ratings dataset at most this often.
+const RATINGS_MAX_AGE: u64 = 7 * 24 * 3600;
+/// After a failed dataset download, don't queue new lookups for this long.
+const RATINGS_RETRY: u64 = 600;
 const USER_AGENT: &str = "Tide/0.1 (+https://github.com/musahinist/tide)";
 const MISS_TTL: u64 = 24 * 3600;
 const MIN_VIDEO_BYTES: u64 = 50_000_000;
@@ -85,6 +90,8 @@ pub struct MetaState {
     gate: tokio::sync::Semaphore,
     images: Mutex<VecDeque<(String, Arc<String>)>>,
     http: OnceLock<reqwest::Client>,
+    /// Background IMDb-dataset rating fill-ins (Cinemeta lacks ratings for new titles).
+    ratings: Arc<RatingQueue>,
 }
 
 impl Default for MetaState {
@@ -94,6 +101,7 @@ impl Default for MetaState {
             gate: tokio::sync::Semaphore::new(2),
             images: Mutex::new(VecDeque::new()),
             http: OnceLock::new(),
+            ratings: Arc::default(),
         }
     }
 }
@@ -113,6 +121,39 @@ impl MetaState {
                     .expect("reqwest client")
             })
             .clone()
+    }
+
+    /// In-memory info, with a rating the background worker found since it was cached.
+    fn cached(&self, dd: &Path, key: &str) -> Option<MediaInfo> {
+        let mut i = self.with(dd, |g| g.infos.get(key).cloned())?;
+        if i.imdb_rating.is_none() {
+            let hit = self.ratings.q.lock().unwrap().done.get(key).copied();
+            if let Some((r, v)) = hit {
+                (i.imdb_rating, i.imdb_votes) = (Some(r), Some(v));
+                self.with(dd, |g| g.infos.insert(key.to_string(), i.clone()));
+            }
+        }
+        Some(i)
+    }
+
+    /// Queue an IMDb-dataset rating lookup for a matched title without one. Off the
+    /// request path: the worker patches the sidecars and the next poll picks it up.
+    fn want_rating(&self, dd: &Path, cm: &Cinemeta, key: &str, info: &MediaInfo, loc: &Loc) {
+        if info.imdb_rating.is_some() || info.needs_match || !valid_tt(&info.imdb_id) {
+            return;
+        }
+        let rq = self.ratings.clone();
+        let start = {
+            let mut g = rq.q.lock().unwrap();
+            if now_secs() < g.retry_after || !g.tried.insert(key.to_string()) {
+                return;
+            }
+            g.pending.insert(key.to_string(), (info.imdb_id.clone(), loc.clone()));
+            !std::mem::replace(&mut g.running, true)
+        };
+        if start {
+            tokio::spawn(rating_worker(rq, dd.to_path_buf(), cm.http.clone(), cm.ratings_url.clone()));
+        }
     }
 
     fn with<R>(&self, dd: &Path, f: impl FnOnce(&mut Inner) -> R) -> R {
@@ -167,6 +208,8 @@ pub struct Cinemeta {
     pub base: String,
     /// metahub image base (poster fallback when a meta has none).
     pub images: String,
+    /// IMDb's title.ratings.tsv.gz (rating fallback).
+    pub ratings_url: String,
     pub http: reqwest::Client,
 }
 
@@ -360,8 +403,12 @@ impl Cinemeta {
     pub fn new(base: &str, http: reqwest::Client) -> Self {
         let base = base.trim_end_matches('/').to_string();
         // Tests point both at a local mock server.
-        let images = if base == CINEMETA { METAHUB.to_string() } else { base.clone() };
-        Cinemeta { base, images, http }
+        let (images, ratings_url) = if base == CINEMETA {
+            (METAHUB.to_string(), IMDB_RATINGS.to_string())
+        } else {
+            (base.clone(), format!("{base}/title.ratings.tsv.gz"))
+        };
+        Cinemeta { base, images, ratings_url, http }
     }
 
     /// One polite retry (after 1.5 s) on timeouts / 5xx: Cinemeta sporadically answers 500.
@@ -533,6 +580,19 @@ fn country_matches(meta: &Value, code: &str) -> bool {
         .is_some_and(|(_, names)| names.iter().any(|n| c.contains(n)))
 }
 
+/// Sort key: open-ended ("2023-") first, then by latest year in releaseInfo.
+fn recency(c: &Cand) -> (bool, u16) {
+    let ri = c.release_info.as_deref().unwrap_or("").trim();
+    let open = ri.ends_with(['-', '–']);
+    let last = ri
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter_map(|t| t.parse::<u16>().ok().filter(|y| *y > 1850))
+        .last()
+        .or(c.year)
+        .unwrap_or(0);
+    (open, last)
+}
+
 /// Merge the parses (torrent name first, then main video, then its folder).
 fn merged(parses: &[Parsed]) -> Parsed {
     let mut base = parses.iter().find(|p| !p.title.is_empty()).cloned().unwrap_or_default();
@@ -613,26 +673,41 @@ pub async fn auto_match(cm: &Cinemeta, parses: &[Parsed]) -> Result<Outcome, Net
                     note: format!("{} (query {v:?})", conf.reason),
                 });
             }
-            // US/UK versions etc.: let the country hint break the tie.
-            if conf.ambiguous {
-                if let Some(code) = q.country.as_deref() {
-                    let strong: Vec<&Cand> = top
-                        .iter()
-                        .filter(|c| nameparse::similarity(v, &c.name) >= nameparse::SIM_NO_YEAR)
-                        .take(3)
-                        .collect();
-                    let mut hits = Vec::new();
-                    for c in strong {
-                        if let Ok(m) = cm.meta(kind, &c.id).await {
-                            if country_matches(&m, code) {
-                                hits.push(c.id.clone());
-                            }
-                        }
+            // Same-name titles: the requested episode, then the country hint, break the tie.
+            let ep = if kind == MediaType::Tv { q.season.zip(q.episode) } else { None };
+            if conf.ambiguous && (ep.is_some() || q.country.is_some()) {
+                let mut strong: Vec<&Cand> = top
+                    .iter()
+                    .filter(|c| nameparse::similarity(v, &c.name) >= nameparse::SIM_NO_YEAR)
+                    .collect();
+                // Running / recent shows first: the 3-meta budget goes to the likely ones.
+                strong.sort_by_key(|c| std::cmp::Reverse(recency(c)));
+                let mut metas: Vec<(&Cand, Value)> = Vec::new();
+                for c in strong.into_iter().take(3) {
+                    if let Ok(m) = cm.meta(kind, &c.id).await {
+                        metas.push((c, m));
                     }
+                }
+                if let Some((s, e)) = ep {
+                    let has: Vec<(&Cand, Value)> =
+                        metas.iter().filter(|(_, m)| find_episode(m, Some(s), Some(e), None).is_some()).cloned().collect();
+                    if has.len() == 1 {
+                        return Ok(Outcome::Matched {
+                            kind,
+                            id: has[0].0.id.clone(),
+                            note: format!("{}; only {} has S{s:02}E{e:02}", conf.reason, has[0].0.id),
+                        });
+                    }
+                    if !has.is_empty() {
+                        metas = has;
+                    }
+                }
+                if let Some(code) = q.country.as_deref() {
+                    let hits: Vec<&Cand> = metas.iter().filter(|(_, m)| country_matches(m, code)).map(|(c, _)| *c).collect();
                     if hits.len() == 1 {
                         return Ok(Outcome::Matched {
                             kind,
-                            id: hits.remove(0),
+                            id: hits[0].id.clone(),
                             note: format!("{}; country {code} decides", conf.reason),
                         });
                     }
@@ -848,8 +923,9 @@ fn nfo_xml(info: &MediaInfo, single_file: bool) -> String {
         }
     }
     if let Some(r) = info.imdb_rating {
+        let votes = info.imdb_votes.map(|v| format!("<votes>{v}</votes>")).unwrap_or_default();
         x.push_str(&format!(
-            "  <ratings><rating name=\"imdb\" max=\"10\" default=\"true\"><value>{r:.1}</value></rating></ratings>\n"
+            "  <ratings><rating name=\"imdb\" max=\"10\" default=\"true\"><value>{r:.1}</value>{votes}</rating></ratings>\n"
         ));
     }
     if !episode && !info.imdb_id.is_empty() {
@@ -878,34 +954,8 @@ fn read_sidecar(loc: &Loc) -> Option<TideJson> {
 /// Never writes a name the torrent itself owns. Failures are logged, not fatal.
 fn write_sidecars(loc: &Loc, key: &str, info: &MediaInfo, poster: Option<&[u8]>, fanart: Option<&[u8]>) {
     let n = names(loc.stem.as_deref());
-    let put = |rel: &str, data: Option<&[u8]>| {
-        if loc.is_owned(rel) {
-            return;
-        }
-        let p = loc.dir.join(rel);
-        let res = match data {
-            Some(d) => write_atomic(&p, d),
-            // A previous match's image would be wrong now.
-            None => match std::fs::remove_file(&p) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-                _ => Ok(()),
-            },
-        };
-        if let Err(e) = res {
-            tracing::warn!("sidecar {} failed: {e}", p.display());
-        }
-    };
-    put(&n.poster, poster);
-    put(&n.fanart, fanart);
-    let single = loc.stem.is_some();
-    let (nfo, other) = match info.media_type {
-        MediaType::Movie => (&n.nfo_movie, &n.nfo_tv),
-        MediaType::Tv => (&n.nfo_tv, &n.nfo_movie),
-    };
-    if other != nfo {
-        put(other, None);
-    }
-    put(nfo, Some(nfo_xml(info, single).as_bytes()));
+    put_sidecar(loc, &n.poster, poster);
+    put_sidecar(loc, &n.fanart, fanart);
     let tj = TideJson {
         tide: 1,
         key: key.to_string(),
@@ -915,7 +965,41 @@ fn write_sidecars(loc: &Loc, key: &str, info: &MediaInfo, poster: Option<&[u8]>,
         source: "cinemeta".into(),
         info: info.clone(),
     };
-    put(&n.json, Some(&serde_json::to_vec_pretty(&tj).unwrap_or_default()));
+    write_text_sidecars(loc, &tj);
+}
+
+/// Write (`Some`) or remove (`None`) one sidecar; never a torrent-owned name.
+fn put_sidecar(loc: &Loc, rel: &str, data: Option<&[u8]>) {
+    if loc.is_owned(rel) {
+        return;
+    }
+    let p = loc.dir.join(rel);
+    let res = match data {
+        Some(d) => write_atomic(&p, d),
+        // A previous match's image would be wrong now.
+        None => match std::fs::remove_file(&p) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        },
+    };
+    if let Err(e) = res {
+        tracing::warn!("sidecar {} failed: {e}", p.display());
+    }
+}
+
+/// The .nfo, then `tide.json` (last: its presence means complete).
+fn write_text_sidecars(loc: &Loc, tj: &TideJson) {
+    let n = names(loc.stem.as_deref());
+    let single = loc.stem.is_some();
+    let (nfo, other) = match tj.info.media_type {
+        MediaType::Movie => (&n.nfo_movie, &n.nfo_tv),
+        MediaType::Tv => (&n.nfo_tv, &n.nfo_movie),
+    };
+    if other != nfo {
+        put_sidecar(loc, other, None);
+    }
+    put_sidecar(loc, nfo, Some(nfo_xml(&tj.info, single).as_bytes()));
+    put_sidecar(loc, &n.json, Some(&serde_json::to_vec_pretty(tj).unwrap_or_default()));
 }
 
 /// Our sidecars that exist on disk (never torrent-owned files).
@@ -976,7 +1060,7 @@ async fn scan_tt(st: Option<&AppState>, key: &str, loc: &Loc) -> Option<String> 
         let bytes = if f.progress_bytes >= f.size {
             tokio::fs::read(&path).await.ok()
         } else if let (Some(st), false) = (st, loc.paused) {
-            engine::read_file(st, key, f.index, MAX_TEXT_BYTES as usize, 20).await.ok()
+            engine::read_file(st, key, f.index, MAX_TEXT_BYTES as usize, 20, false).await.ok()
         } else {
             None
         };
@@ -1023,6 +1107,7 @@ async fn apply_match(
     meta.with(dd, |g| {
         g.infos.insert(key.to_string(), info.clone());
     });
+    meta.want_rating(dd, cm, key, &info, loc);
     meta.with_index(dd, |ix| {
         ix.misses.remove(key);
         ix.needs.remove(key);
@@ -1042,7 +1127,7 @@ pub async fn lookup_loc(
     loc: &Loc,
     now: u64,
 ) -> Result<Option<MediaInfo>, String> {
-    if let Some(i) = meta.with(dd, |g| g.infos.get(key).cloned()) {
+    if let Some(i) = meta.cached(dd, key) {
         return Ok(Some(i));
     }
     // Sidecar: no network, ever.
@@ -1053,6 +1138,7 @@ pub async fn lookup_loc(
         let mut info = tj.info;
         info.manual = tj.manual;
         meta.with(dd, |g| g.infos.insert(key.to_string(), info.clone()));
+        meta.want_rating(dd, cm, key, &info, loc);
         return Ok(Some(info));
     }
     if !loc.worth_lookup() {
@@ -1073,7 +1159,7 @@ pub async fn lookup_loc(
     }
 
     let _permit = meta.gate.acquire().await.map_err(internal)?;
-    if let Some(i) = meta.with(dd, |g| g.infos.get(key).cloned()) {
+    if let Some(i) = meta.cached(dd, key) {
         return Ok(Some(i));
     }
     let parses = loc.parses();
@@ -1135,7 +1221,7 @@ fn norm_key(key: &str) -> String {
 pub async fn get_media_info(state: St<'_>, key: String) -> Result<Option<MediaInfo>, String> {
     let key = norm_key(&key);
     let st: Arc<AppState> = state.inner().clone();
-    if let Some(i) = st.meta.with(&st.data_dir, |g| g.infos.get(&key).cloned()) {
+    if let Some(i) = st.meta.cached(&st.data_dir, &key) {
         return Ok(Some(i));
     }
     let loc = locate(&st, &key)?;
@@ -1248,6 +1334,166 @@ pub async fn clear_media_match(state: St<'_>, key: String) -> Result<(), String>
     }
     forget(&st, &key);
     Ok(())
+}
+
+// ---------------------------------------------------------------- IMDb rating fallback
+
+#[derive(Default)]
+struct RatingQueue {
+    q: Mutex<RqInner>,
+}
+
+#[derive(Default)]
+struct RqInner {
+    /// key -> (IMDb id, where its sidecars are).
+    pending: HashMap<String, (String, Loc)>,
+    /// Keys queued this session (each is looked up at most once per run).
+    tried: HashSet<String>,
+    /// Ratings found: key -> (rating, votes), merged into memory by `MetaState::cached`.
+    done: HashMap<String, (f32, u32)>,
+    running: bool,
+    retry_after: u64,
+}
+
+/// Drains the queue in batches: one dataset scan serves every pending title.
+async fn rating_worker(rq: Arc<RatingQueue>, dd: PathBuf, http: reqwest::Client, url: String) {
+    // Let the burst of polls (one per torrent row) land in the same batch.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    loop {
+        let batch: Vec<(String, (String, Loc))> = {
+            let mut g = rq.q.lock().unwrap();
+            if g.pending.is_empty() {
+                g.running = false;
+                return;
+            }
+            g.pending.drain().collect()
+        };
+        let Some(path) = ensure_ratings(&http, &url, &dd).await else {
+            let mut g = rq.q.lock().unwrap();
+            g.retry_after = now_secs() + RATINGS_RETRY;
+            for (k, _) in &batch {
+                g.tried.remove(k);
+            }
+            continue;
+        };
+        let ids: HashSet<String> = batch.iter().map(|(_, (id, _))| id.clone()).collect();
+        let p2 = path.clone();
+        let found = match tokio::task::spawn_blocking(move || std::fs::File::open(&p2).and_then(|f| scan_ratings(f, &ids))).await {
+            Ok(Ok(f)) => f,
+            r => {
+                tracing::warn!("IMDb ratings scan failed ({r:?}); dropping the file");
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+        };
+        for (key, (id, loc)) in batch {
+            let Some(&(r, v)) = found.get(&id) else {
+                tracing::debug!("{id}: not in the IMDb ratings dataset");
+                continue;
+            };
+            if let Some(mut tj) = read_sidecar(&loc).filter(|t| t.info.imdb_id == id && t.info.imdb_rating.is_none()) {
+                (tj.info.imdb_rating, tj.info.imdb_votes) = (Some(r), Some(v));
+                write_text_sidecars(&loc, &tj);
+            }
+            rq.q.lock().unwrap().done.insert(key, (r, v));
+        }
+    }
+}
+
+/// `data_dir/imdb/title.ratings.tsv.gz`, refreshed at most once per `RATINGS_MAX_AGE`.
+/// A stale copy is used when the refresh fails.
+async fn ensure_ratings(http: &reqwest::Client, url: &str, dd: &Path) -> Option<PathBuf> {
+    let path = dd.join("imdb").join("title.ratings.tsv.gz");
+    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    if mtime.and_then(|t| t.elapsed().ok()).is_some_and(|a| a.as_secs() < RATINGS_MAX_AGE) {
+        return Some(path);
+    }
+    match download_ratings(http, url, &path, mtime).await {
+        Ok(()) => Some(path),
+        Err(e) => {
+            tracing::warn!("IMDb ratings download failed: {e}");
+            mtime.map(|_| path)
+        }
+    }
+}
+
+async fn download_ratings(http: &reqwest::Client, url: &str, path: &Path, since: Option<std::time::SystemTime>) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt as _;
+    let dir = path.parent().ok_or("no parent")?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let mut req = http.get(url).timeout(Duration::from_secs(300));
+    if let Some(t) = since {
+        req = req.header(reqwest::header::IF_MODIFIED_SINCE, http_date(t));
+    }
+    let mut resp = req.send().await.map_err(|e| e.to_string())?;
+    match resp.status().as_u16() {
+        304 => {
+            // Unchanged: restart the 7-day clock.
+            return std::fs::File::options()
+                .append(true)
+                .open(path)
+                .and_then(|f| f.set_modified(std::time::SystemTime::now()))
+                .map_err(|e| e.to_string());
+        }
+        s if !(200..300).contains(&s) => return Err(format!("HTTP {s} from {url}")),
+        _ => {}
+    }
+    let tmp = dir.join(".title.ratings.tsv.gz.tmp");
+    let mut f = tokio::fs::File::create(&tmp).await.map_err(|e| e.to_string())?;
+    while let Some(c) = resp.chunk().await.map_err(|e| e.to_string())? {
+        f.write_all(&c).await.map_err(|e| e.to_string())?;
+    }
+    f.flush().await.map_err(|e| e.to_string())?;
+    drop(f);
+    tokio::fs::rename(&tmp, path).await.map_err(|e| e.to_string())
+}
+
+/// Stream-decompress `tconst\taverageRating\tnumVotes` and keep only `ids`.
+fn scan_ratings(r: impl std::io::Read, ids: &HashSet<String>) -> std::io::Result<HashMap<String, (f32, u32)>> {
+    use std::io::BufRead;
+    let mut out = HashMap::new();
+    let mut rd = std::io::BufReader::with_capacity(1 << 16, flate2::read::GzDecoder::new(r));
+    let mut line = String::new();
+    while out.len() < ids.len() {
+        line.clear();
+        if rd.read_line(&mut line)? == 0 {
+            break;
+        }
+        let mut it = line.trim_end().split('\t');
+        let Some(id) = it.next().filter(|id| ids.contains(*id)) else { continue };
+        let rating = it.next().and_then(|x| x.parse::<f32>().ok()).filter(|r| *r > 0.0);
+        let votes = it.next().and_then(|x| x.parse::<u32>().ok());
+        if let (Some(r), Some(v)) = (rating, votes) {
+            out.insert(id.to_string(), (r, v));
+        }
+    }
+    Ok(out)
+}
+
+/// RFC 7231 IMF-fixdate ("Sun, 06 Nov 1994 08:49:37 GMT").
+fn http_date(t: std::time::SystemTime) -> String {
+    const MON: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const WD: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    let secs = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let (days, rem) = ((secs / 86400) as i64, secs % 86400);
+    // Civil-from-days (H. Hinnant).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{}, {d:02} {} {y} {:02}:{:02}:{:02} GMT",
+        WD[(days % 7) as usize],
+        MON[(m - 1) as usize],
+        rem / 3600,
+        rem / 60 % 60,
+        rem % 60
+    )
 }
 
 // ---------------------------------------------------------------- tests
@@ -1641,5 +1887,97 @@ mod tests {
         eprintln!("poster {} B, fanart {} B (JPEG)", pj.len(), bj.len());
         assert_eq!(image_mime(&pj), Some("image/jpeg"));
         assert!(bj.len() < 700_000);
+    }
+
+    #[test]
+    fn ratings_scan_and_http_date() {
+        use std::io::Write;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(b"tconst\taverageRating\tnumVotes\ntt0000001\t5.7\t2000\ntt31049299\t5.7\t15428\ntt17491088\t8.0\t102371\n").unwrap();
+        let bytes = gz.finish().unwrap();
+        let ids: HashSet<String> = ["tt31049299".to_string(), "tt9999999".to_string()].into();
+        let f = scan_ratings(&bytes[..], &ids).unwrap();
+        assert_eq!(f.len(), 1);
+        assert_eq!(f["tt31049299"], (5.7, 15428));
+        let t = std::time::UNIX_EPOCH + Duration::from_secs(784_111_777);
+        assert_eq!(http_date(t), "Sun, 06 Nov 1994 08:49:37 GMT");
+        assert_eq!(http_date(std::time::UNIX_EPOCH + Duration::from_secs(951_782_400)), "Tue, 29 Feb 2000 00:00:00 GMT");
+    }
+
+    #[tokio::test]
+    async fn rating_fallback_patches_old_sidecar() {
+        use std::io::Write;
+        let dd = tmpdir("dd");
+        let dl = tmpdir("dl");
+        let folder = dl.join("Animals.2026.1080p");
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(b"tconst\taverageRating\tnumVotes\ntt31049299\t5.7\t15428\n").unwrap();
+        let mock = mock_server(vec![("/title.ratings.tsv.gz".to_string(), gz.finish().unwrap())]).await;
+        let cm = Cinemeta::new(&mock.base, http());
+        let files = vec![frow(0, "Animals.2026.1080p/a.mkv", 900_000_000, FileKind::Video), frow(1, "Animals.2026.1080p/b.srt", 1, FileKind::Other)];
+        let loc = Loc::from_parts(&folder, files, "Animals.2026.1080p", false);
+        let key = "c".repeat(40);
+        // An old sidecar: no rating, no imdb_votes field at all.
+        let old = format!(r#"{{"tide":1,"key":"{key}","info":{{"imdb_id":"tt31049299","media_type":"movie","title":"Animals","imdb_rating":null}}}}"#);
+        std::fs::write(folder.join("tide.json"), old).unwrap();
+        let meta = MetaState::default();
+        let i = lookup_loc(&meta, &dd, &cm, None, &key, &loc, 1000).await.unwrap().unwrap();
+        assert_eq!((i.imdb_rating, i.imdb_votes), (None, None), "request path does not wait");
+        let mut got = None;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let i = lookup_loc(&meta, &dd, &cm, None, &key, &loc, 1000).await.unwrap().unwrap();
+            if i.imdb_rating.is_some() {
+                got = Some(i);
+                break;
+            }
+        }
+        let i = got.expect("rating filled in");
+        assert_eq!((i.imdb_rating, i.imdb_votes), (Some(5.7), Some(15428)));
+        let tj: TideJson = serde_json::from_slice(&std::fs::read(folder.join("tide.json")).unwrap()).unwrap();
+        assert_eq!((tj.info.imdb_rating, tj.info.imdb_votes, tj.key.as_str()), (Some(5.7), Some(15428), key.as_str()));
+        let nfo = std::fs::read_to_string(folder.join("movie.nfo")).unwrap();
+        assert!(nfo.contains("<value>5.7</value><votes>15428</votes>"), "{nfo}");
+        assert!(dd.join("imdb/title.ratings.tsv.gz").is_file());
+        // Fresh file (< 7 days): no second download.
+        let n = mock.hits.lock().unwrap().iter().filter(|h| h.starts_with("/title.ratings")).count();
+        assert_eq!(n, 1);
+        let _ = std::fs::remove_dir_all(&dd);
+        let _ = std::fs::remove_dir_all(&dl);
+    }
+
+    #[tokio::test]
+    async fn same_name_series_tie_broken_by_episode() {
+        let search = br#"{"metas":[
+            {"id":"tt13944906","name":"The Diplomat","releaseInfo":"2019","type":"series"},
+            {"id":"tt17006090","name":"The Diplomat","releaseInfo":"2015","type":"series"},
+            {"id":"tt17491088","name":"The Diplomat","releaseInfo":"2023-","type":"series"}]}"#.to_vec();
+        let meta = |id: &str, vids: &str| {
+            format!(r#"{{"meta":{{"id":"{id}","type":"series","name":"The Diplomat","country":"United States","videos":[{vids}]}}}}"#).into_bytes()
+        };
+        let mut routes = vec![
+            ("/meta/series/tt17491088.json".to_string(), meta("tt17491088", r#"{"season":4,"episode":6},{"season":4,"episode":7}"#)),
+            ("/meta/series/tt13944906.json".to_string(), meta("tt13944906", r#"{"season":1,"episode":1},{"season":1,"episode":7}"#)),
+            ("/meta/series/tt17006090.json".to_string(), meta("tt17006090", r#"{"season":1,"episode":1}"#)),
+        ];
+        for q in ["The%20Diplomat", "The%20Diplomat%20US", "the%20diplomat", "the%20diplomat%20us"] {
+            routes.push((format!("/catalog/series/top/search={q}.json"), search.clone()));
+        }
+        let mock = mock_server(routes).await;
+        let cm = Cinemeta::new(&mock.base, http());
+        let p = nameparse::parse("the.diplomat.us.s04e07.1080p.web.h264.mkv");
+        match auto_match(&cm, &[p.clone()]).await.unwrap() {
+            Outcome::Matched { kind, id, note } => {
+                assert_eq!((kind, id.as_str()), (MediaType::Tv, "tt17491088"), "{note}");
+                assert!(note.contains("S04E07"), "{note}");
+            }
+            o => panic!("expected a match for {p:?}, got {o:?}; hits {:?}", mock.hits.lock().unwrap()),
+        }
+        // Two candidates with the episode -> still needs_match (only one may win).
+        let mut p2 = p.clone();
+        (p2.season, p2.episode, p2.country) = (Some(1), Some(1), None);
+        let o = auto_match(&cm, &[p2]).await.unwrap();
+        assert!(matches!(o, Outcome::Needs { .. } | Outcome::NoMatch), "{o:?}");
     }
 }

@@ -2,6 +2,7 @@
 
 mod artwork;
 mod engine;
+mod groups;
 mod macos;
 mod metadata;
 mod nameparse;
@@ -97,7 +98,7 @@ fn main() -> anyhow::Result<()> {
     println!("tide: stream server on http://127.0.0.1:{}/", st.stream_port);
     tracing::info!(port = st.stream_port, "stream server listening");
 
-    macos::register_default_magnet_handler(BUNDLE_ID);
+    macos::register_default_magnet_handler(BUNDLE_ID, &st.data_dir);
 
     let setup_state = st.clone();
     let si_state = st.clone();
@@ -139,6 +140,7 @@ fn main() -> anyhow::Result<()> {
                 iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     iv.tick().await;
+                    engine::pause_finished(&st).await;
                     let rows = engine::list_rows(&st);
                     if let Err(e) = handle.emit("torrents-updated", rows) {
                         tracing::debug!("emit torrents-updated failed: {e}");
@@ -172,6 +174,15 @@ fn main() -> anyhow::Result<()> {
             player::get_subtitle_vtt,
             player::open_in_vlc,
             player::open_external,
+            // groups + watched
+            groups::list_groups,
+            groups::create_group,
+            groups::rename_group,
+            groups::add_to_group,
+            groups::remove_from_group,
+            groups::delete_group,
+            groups::get_watched,
+            groups::set_watched,
         ])
         .run(tauri::generate_context!())?;
 

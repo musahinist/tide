@@ -9,7 +9,8 @@ pub enum TorrentState {
     Resolving,
     Initializing,
     Downloading,
-    Seeding,
+    /// Finished downloading; kept paused (Tide never seeds). Resume is refused.
+    Completed,
     Paused,
     Error,
 }
@@ -141,6 +142,9 @@ pub struct MediaInfo {
     /// https://www.imdb.com/title/{imdb_id}/
     pub imdb_url: Option<String>,
     pub imdb_rating: Option<f32>,
+    /// IMDb vote count (from IMDb's title.ratings dataset; absent in older sidecars).
+    #[serde(default)]
+    pub imdb_votes: Option<u32>,
     pub season: Option<u32>,
     pub episode: Option<u32>,
     pub episode_title: Option<String>,
@@ -163,4 +167,27 @@ pub struct TorrentDetails {
     pub magnet: String,
     pub trackers: usize,
     pub save_path: Option<String>,
+}
+
+/// A user-visible episode group (`data_dir/groups.json`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Group {
+    pub id: String,
+    pub name: String,
+    /// Torrent keys (info hashes).
+    #[serde(default)]
+    pub members: Vec<String>,
+    /// Set when the group was materialised from an automatic group key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_key: Option<String>,
+}
+
+/// Contents of `data_dir/groups.json`; also the return value of `list_groups`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GroupsFile {
+    #[serde(default)]
+    pub groups: Vec<Group>,
+    /// Keys the user removed from a group: never auto-grouped again.
+    #[serde(default)]
+    pub excluded: std::collections::BTreeMap<String, bool>,
 }

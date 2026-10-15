@@ -81,7 +81,36 @@ async fn fetch_file_bytes(st: &AppState, key: &str, row: &FileRow, timeout_s: u6
             }
         }
     }
-    engine::read_file(st, key, row.index, SUB_MAX_BYTES, timeout_s).await
+    // Picking a subtitle must not resume a torrent the user paused.
+    engine::read_file(st, key, row.index, SUB_MAX_BYTES, timeout_s, false).await
+}
+
+/// Where to play a file from.
+enum Source {
+    /// Complete on disk: played without touching the torrent (completed torrents stay
+    /// stopped; Tide never seeds).
+    Disk(PathBuf),
+    /// librqbit stream URL (torrent made live and initialized first).
+    Stream(String),
+}
+
+async fn media_source(st: &AppState, key: &str, row: &FileRow) -> Result<Source, String> {
+    if row.progress >= 1.0 {
+        if let Ok(p) = engine::file_abs_path(st, key, row.index) {
+            if p.is_file() {
+                return Ok(Source::Disk(p));
+            }
+        }
+    }
+    engine::ensure_live(st, key).await?;
+    Ok(Source::Stream(engine::stream_url(st, key, row.index)?))
+}
+
+/// Builtin player URL for a file on disk (Tauri asset protocol; the file is added to
+/// the asset scope here, nothing else is reachable).
+fn asset_url(app: &AppHandle, path: &Path) -> Result<String, String> {
+    app.asset_protocol_scope().allow_file(path).map_err(internal)?;
+    Ok(format!("asset://localhost/{}", urlencoding::encode(&path.to_string_lossy())))
 }
 
 async fn vtt_for(st: &AppState, sub_id: &str) -> Result<Arc<String>, String> {
@@ -153,7 +182,10 @@ fn spawn_vlc(vlc: &Path, title: &str, url: &str, sub: Option<&Path>) -> Result<(
 async fn launch_vlc(st: &AppState, key: &str, idx: usize, sub_id: Option<&str>) -> Result<PlayResult, String> {
     let vlc = find_vlc().ok_or("VLC_NOT_FOUND: VLC is not installed")?;
     let (files, row) = find_file(st, key, idx)?;
-    let url = engine::stream_url(st, key, idx)?;
+    let url = match media_source(st, key, &row).await? {
+        Source::Disk(p) => p.to_string_lossy().into_owned(),
+        Source::Stream(u) => u,
+    };
     let title = basename(&row.name).to_string();
     let (subtitles, default_sub) = subtitle_tracks(key, &files, &row);
     let sub_path = match sub_id {
@@ -187,13 +219,6 @@ pub async fn play_media(app: AppHandle, state: St<'_>, media: MediaRef) -> Resul
     let key = key.to_ascii_lowercase();
     valid_key(&key)?;
 
-    if let Err(e) = engine::ensure_live(&st, &key).await {
-        if e.starts_with("NOT_FOUND") {
-            return Err(e);
-        }
-        tracing::warn!("ensure_live failed: {e}");
-    }
-
     let (files, row) = find_file(&st, &key, file_index)?;
     if !matches!(row.kind, FileKind::Video | FileKind::Audio) {
         return Err("INVALID_INPUT: not a media file".into());
@@ -204,12 +229,16 @@ pub async fn play_media(app: AppHandle, state: St<'_>, media: MediaRef) -> Resul
         return launch_vlc(&st, &key, file_index, default_sub.as_deref()).await;
     }
 
+    let stream_url = match media_source(&st, &key, &row).await? {
+        Source::Disk(p) => asset_url(&app, &p)?,
+        Source::Stream(u) => u,
+    };
     let (subtitles, default_subtitle_id) = subtitle_tracks(&key, &files, &row);
     let result = PlayResult {
         mode: PlayMode::Builtin,
         title: basename(&row.name).to_string(),
         media: MediaRef::Torrent { key: key.clone(), file_index },
-        stream_url: engine::stream_url(&st, &key, file_index)?,
+        stream_url,
         subtitles,
         default_subtitle_id,
     };

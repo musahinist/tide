@@ -44,6 +44,9 @@ fn not_ready(msg: impl std::fmt::Display) -> String {
 fn internal(msg: impl std::fmt::Display) -> String {
     format!("INTERNAL: {msg}")
 }
+fn completed() -> String {
+    "COMPLETED: download finished; completed torrents stay stopped (no seeding)".into()
+}
 
 // ---------------------------------------------------------------- media rules
 
@@ -130,7 +133,8 @@ fn map_state(s: &TorrentStatsState, finished: bool) -> TorrentState {
         // Initializing{paused:true} until resumed, so show it as paused.
         TorrentStatsState::Initializing { paused: true } => TorrentState::Paused,
         TorrentStatsState::Initializing { .. } => TorrentState::Initializing,
-        TorrentStatsState::Live if finished => TorrentState::Seeding,
+        // Finished torrents never seed: a Live+finished one is paused by the next tick.
+        TorrentStatsState::Live | TorrentStatsState::Paused if finished => TorrentState::Completed,
         TorrentStatsState::Live => TorrentState::Downloading,
         TorrentStatsState::Paused => TorrentState::Paused,
         TorrentStatsState::Error => TorrentState::Error,
@@ -358,10 +362,31 @@ pub fn stream_url(st: &AppState, key: &str, idx: usize) -> Result<String, String
     ))
 }
 
-/// Unpause if paused (also retries a torrent in error state).
+/// How long play/resume wait for a file check ("Initializing") to finish.
+const INIT_TIMEOUT_S: u64 = 30;
+
+/// Wait (bounded) until the torrent is out of Initializing. librqbit's streams need
+/// Paused or Live.
+async fn wait_initialized(h: &ManagedTorrent) -> Result<(), String> {
+    tokio::time::timeout(Duration::from_secs(INIT_TIMEOUT_S), h.wait_until_initialized())
+        .await
+        .map_err(|_| not_ready("still checking files"))?
+        .map_err(|e| internal(format!("torrent failed to initialize: {e:#}")))
+}
+
+/// Unpause if paused (also retries a torrent in error state) and wait until it is
+/// initialized. Never wakes a completed torrent: returns `COMPLETED` instead.
 pub async fn ensure_live(st: &AppState, key: &str) -> Result<(), String> {
     let h = handle(st, key)?;
     // Don't call h.is_paused() inside with_state: nested read lock.
+    let paused_flag = h.is_paused();
+    let checking = h.with_state(|s| matches!(s, ManagedTorrentState::Initializing(_)));
+    if checking && !paused_flag {
+        wait_initialized(&h).await?; // so `finished` is known
+    }
+    if h.stats().finished {
+        return Err(completed());
+    }
     let paused_flag = h.is_paused();
     let needs_start = h.with_state(|s| match s {
         ManagedTorrentState::Live(_) => false,
@@ -374,17 +399,44 @@ pub async fn ensure_live(st: &AppState, key: &str) -> Result<(), String> {
             .await
             .map_err(|e| internal(format!("resume failed: {e:#}")))?;
     }
+    wait_initialized(&h).await?;
+    // A torrent parked mid-check can turn out complete only now.
+    if h.stats().finished {
+        let _ = st.session.pause(&h).await;
+        return Err(completed());
+    }
     Ok(())
 }
 
-/// api_stream + read_to_end (prioritizes pieces). Unpauses the torrent if the file is
-/// not complete yet (otherwise the read would never finish).
+/// Pause every Live torrent that has finished downloading (called by the 1 s ticker):
+/// Tide never uploads after a download completes.
+pub async fn pause_finished(st: &AppState) {
+    let done: Vec<Handle> = st.session.with_torrents(|it| {
+        it.filter(|(_, h)| {
+            let s = h.stats();
+            s.finished && matches!(s.state, TorrentStatsState::Live)
+        })
+        .map(|(_, h)| h.clone())
+        .collect()
+    });
+    for h in done {
+        match st.session.pause(&h).await {
+            Ok(()) => tracing::info!(key = %h.info_hash().as_string(), "download complete; paused (no seeding)"),
+            Err(e) => tracing::warn!("auto-pause of finished torrent failed: {e:#}"),
+        }
+    }
+}
+
+/// api_stream + read_to_end (prioritizes pieces). If the file is not complete yet the
+/// torrent must be running: with `may_resume` it is unpaused, otherwise a paused/errored
+/// torrent gives NOT_READY (never resume what the user paused for a background fetch).
 pub async fn read_file(
     st: &AppState,
     key: &str,
     idx: usize,
     max_bytes: usize,
     timeout_s: u64,
+    may_resume: bool,
 ) -> Result<Vec<u8>, String> {
     let h = handle(st, key)?;
     let len = h
@@ -398,7 +450,19 @@ pub async fn read_file(
     }
     let have = h.stats().file_progress.get(idx).copied().unwrap_or(0);
     if have < len {
-        ensure_live(st, key).await?;
+        if may_resume {
+            ensure_live(st, key).await?;
+        } else {
+            let paused_flag = h.is_paused();
+            let running = h.with_state(|s| match s {
+                ManagedTorrentState::Live(_) => true,
+                ManagedTorrentState::Initializing(_) => !paused_flag,
+                _ => false,
+            });
+            if !running {
+                return Err(not_ready("torrent is not running; file not downloaded yet"));
+            }
+        }
     }
 
     let fut = async {
@@ -725,19 +789,22 @@ pub async fn remove_torrent(
 async fn remove(state: &AppState, key: &str, delete_files: bool) -> Result<(), String> {
     let id = parse_key(key)?;
     let k = id.as_string();
-    let was_pending = {
+    let (was_pending, task) = {
         let mut pending = state.pending.lock().unwrap();
         match pending.remove(&k) {
             Some(p) => {
-                if let Some(t) = p.task {
-                    t.abort();
-                }
                 save_pending(state, &pending);
-                true
+                (true, p.task)
             }
-            None => false,
+            None => (false, None),
         }
     };
+    // abort() only requests cancellation: wait for the task to really stop, so an add
+    // that lands late is still caught by the session check below.
+    if let Some(t) = task {
+        t.abort();
+        let _ = t.await;
+    }
     RESOLVE_ERRORS.lock().unwrap().remove(&k);
 
     // Also covers a resolve task that finished right before the abort.
@@ -988,3 +1055,42 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+
+    /// Restart check (not run by default): HOME must hold a copied session dir with
+    /// finished torrents. Prints row states for 40 s while running the ticker's auto-pause.
+    #[test]
+    #[ignore]
+    fn restart_finished() {
+        assert_eq!(std::env::var("TIDE_LIVE_TEST").as_deref(), Ok("1"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+            .try_init();
+        // Same shape as main.rs: init inside block_on, then work on spawned tasks.
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let st = std::sync::Arc::new(rt.block_on(crate::state::init()).unwrap());
+        rt.block_on(restore_pending(&st));
+        let h = rt.spawn(async move {
+            let secs: u32 = std::env::var("TIDE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+            for t in 0..secs {
+                pause_finished(&st).await;
+                for r in list_rows(&st) {
+                    let _ = crate::artwork::pick_artwork(&st, &r.key).await;
+                }
+                let rows = list_rows(&st);
+                let s: Vec<String> = rows
+                    .iter()
+                    .map(|r| format!("{}={:?}/{:.2}", &r.key[..6], r.state, r.progress))
+                    .collect();
+                eprintln!("t={t:>2}s {}", s.join(" "));
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+        while !h.is_finished() {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+}

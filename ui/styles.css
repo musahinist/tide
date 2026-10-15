@@ -157,7 +157,7 @@ body.adding #plus { transform: rotate(45deg); }
   background: var(--faint);
 }
 .s-downloading .dot { background: var(--accent); }
-.s-seeding .dot { background: var(--ok); }
+.s-completed .dot { background: var(--ok); }
 .s-resolving .dot, .s-initializing .dot { background: var(--warn); animation: pulse 1.4s ease-in-out infinite; }
 .s-error .dot { background: var(--err); }
 .s-error .stats { color: #c98a86; }
@@ -165,7 +165,7 @@ body.adding #plus { transform: rotate(45deg); }
 
 .bar { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: var(--track); }
 .bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .9s linear, background .3s; }
-.s-seeding .bar i { background: #3a9a52; }
+.s-completed .bar i { background: #3a9a52; }
 .s-paused .bar i { background: #6a6a6a; }
 .s-error .bar i { background: var(--err); }
 .s-resolving .bar i, .s-initializing .bar i { background: var(--warn); }
@@ -374,3 +374,54 @@ body.adding #plus { transform: rotate(45deg); }
 .mrow.mlabel { width: auto; }
 .mval { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #bbb; }
 .mono { font: 11px ui-monospace, Menlo, monospace; }
+
+/* ---------- groups ---------- */
+.group .head { cursor: default; }
+.gctl { position: absolute; top: 0; right: 0; bottom: 3px; display: flex; align-items: center; gap: 4px; padding: 0 14px; }
+.gnext {
+  height: 26px; padding: 0 12px; border: 0; border-radius: 13px;
+  background: rgba(255, 255, 255, .08); color: #e8e8e8; font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums;
+  transition: background .15s;
+}
+.gnext:hover { background: var(--accent); color: #fff; }
+.gnext[hidden] { display: none; }
+.gmore { opacity: 0; transition: opacity .15s; }
+.group .head:hover .gmore { opacity: 1; }
+.group.expanded > .head { background: var(--row-hover); }
+.eps { background: var(--sub); }
+.eps[hidden] { display: none; }
+.season { padding: 10px 20px 4px 44px; color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
+
+/* episode rows inside a group */
+.torrent.ep { background: transparent; animation: none; }
+.ep .head { height: 52px; padding: 9px 20px 0 44px; }
+.ep .head.has-art { padding-left: 44px; }
+.ep .art, .ep .thumb, .ep .head.has-art::before { display: none; }
+.ep .name { font-size: 13px; color: #e0e0e0; }
+.ep .stats { margin-top: 2px; font-size: 11px; }
+.ep .bar { left: 44px; height: 2px; background: rgba(255, 255, 255, .05); }
+.ep .ctl { background: linear-gradient(to right, transparent, var(--row-hover) 40px); }
+.wcheck { display: none; }
+.ep .wcheck {
+  display: grid; place-items: center; position: absolute; left: 16px; top: 15px;
+  width: 18px; height: 18px; padding: 0; border: 1px solid #555; border-radius: 50%;
+  background: none; color: transparent; font-size: 11px; line-height: 1; transition: color .15s, border-color .15s, background .15s;
+}
+.ep .wcheck:hover { border-color: var(--ok); color: rgba(63, 185, 80, .6); }
+.ep .wcheck.on { border-color: transparent; background: rgba(63, 185, 80, .18); color: var(--ok); }
+
+/* ---------- ⋯ menu ---------- */
+.menu {
+  position: fixed; z-index: 15; min-width: 170px; max-width: 260px; padding: 4px;
+  border-radius: 8px; background: #2f2f2f; border: 1px solid rgba(255, 255, 255, .08);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .5); animation: pop .12s ease;
+}
+.menu[hidden] { display: none; }
+.mi { display: block; width: 100%; padding: 5px 10px; border: 0; border-radius: 5px; background: none; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mi:hover { background: var(--accent); color: #fff; }
+.mi.new { color: var(--muted); }
+.mi.new:hover { color: #fff; }
+.mform input {
+  width: 100%; height: 26px; padding: 0 8px; border: 1px solid rgba(47, 126, 230, .6); border-radius: 5px;
+  background: var(--row); color: var(--text); font: inherit; outline: none; -webkit-user-select: text; user-select: text;
+}

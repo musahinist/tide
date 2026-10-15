@@ -7,7 +7,7 @@ edition = "2021"
 tauri-build = { version = "2.7", features = [] }
 
 [dependencies]
-tauri = { version = "2.12", features = [] }
+tauri = { version = "2.12", features = ["protocol-asset"] }
 # "tracing-subscriber-utils" is required: librqbit 9.0.1 with only "http-api" fails to
 # compile (E0599 api_log_lines_stream). With it, Api::new takes 3 args.
 librqbit = { version = "=9.0.1", features = ["http-api", "tracing-subscriber-utils"] }
@@ -22,6 +22,8 @@ urlencoding = "2"
 # Metadata (Cinemeta). Same reqwest/rustls stack librqbit already compiles: no second TLS stack.
 reqwest = { version = "0.13", default-features = false, features = ["default-tls"] }
 regex = "1"
+# IMDb title.ratings.tsv.gz fallback (already in the tree via librqbit).
+flate2 = "1"
 strsim = "0.11"
 tauri-plugin-deep-link = "2"
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }

@@ -15,7 +15,6 @@ use tauri::State;
 
 use crate::engine;
 use crate::state::AppState;
-use crate::types::TorrentState;
 
 type St<'a> = State<'a, Arc<AppState>>;
 
@@ -235,11 +234,8 @@ pub async fn pick_artwork(st: &AppState, key: &str) -> Result<Artwork, String> {
                 .await
                 .map_err(|e| format!("INTERNAL: read {}: {e}", p.display()))?
         } else {
-            // Don't resume a torrent the user paused just to fetch artwork.
-            if row.as_ref().is_some_and(|r| r.state == TorrentState::Paused) {
-                return Err("NOT_READY: torrent is paused; artwork not downloaded yet".into());
-            }
-            engine::read_file(st, key, idx, MAX_IMAGE_BYTES as usize, 30).await?
+            // Never resume a paused/errored torrent just to fetch artwork.
+            engine::read_file(st, key, idx, MAX_IMAGE_BYTES as usize, 30, false).await?
         };
         return Ok(Artwork { poster: Some(data_url(&f.name, &bytes)), kind: Some(kind) });
     }

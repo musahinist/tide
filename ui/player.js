@@ -201,7 +201,8 @@
       if (video.videoWidth === 0) return openInVlc(true);
       if (video.videoTracks && video.videoTracks.length === 0) return openInVlc(true);
     }
-    if (el.audioTracks && el.audioTracks.length === 0) return openInVlc(true);
+    // Only audio files need an audio track; a silent video is fine.
+    if (isAudio && el.audioTracks && el.audioTracks.length === 0) return openInVlc(true);
     applyResume();
   }
 
@@ -210,7 +211,9 @@
     const err = el.error;
     if (!err) return;
     // 3 = MEDIA_ERR_DECODE, 4 = MEDIA_ERR_SRC_NOT_SUPPORTED
-    if (err.code === 3 || err.code === 4) return openInVlc(true);
+    // WebKit reports HTTP/network failures before metadata as code 4 too, so only
+    // treat 4 as "unsupported format" once metadata was read.
+    if (err.code === 3 || (err.code === 4 && el.readyState >= 1)) return openInVlc(true);
     showMessage('Playback stopped because of a network error.', { openVlc: true });
   }
 
