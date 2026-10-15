@@ -1,0 +1,12 @@
+{
+  "identifier": "default",
+  "windows": [
+    "main",
+    "player"
+  ],
+  "permissions": [
+    "core:default",
+    "deep-link:default",
+    "core:window:allow-start-dragging"
+  ]
+}

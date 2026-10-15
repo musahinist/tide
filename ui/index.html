@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tide</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header id="top" data-tauri-drag-region>
+    <form id="add" autocomplete="off" spellcheck="false">
+      <input id="magnet" type="text" placeholder="Paste a magnet link" aria-label="Magnet link">
+      <span id="add-err" role="alert"></span>
+    </form>
+    <button id="plus" class="icon" title="Add magnet link" aria-label="Add magnet link">
+      <svg viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></svg>
+    </button>
+  </header>
+
+  <main id="list"></main>
+  <p id="empty" hidden>Drop a magnet link or press ⌘V</p>
+
+  <div id="modal" hidden>
+    <form id="confirm" class="sheet">
+      <p class="title">Remove <span id="confirm-name"></span>?</p>
+      <label class="check"><input id="confirm-delete" type="checkbox"> Also delete files</label>
+      <div class="actions">
+        <button type="button" id="confirm-cancel">Cancel</button>
+        <button type="submit" class="danger">Remove</button>
+      </div>
+    </form>
+  </div>
+
+  <div id="toast" role="status"><span id="toast-msg"></span><button id="toast-act" hidden></button></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

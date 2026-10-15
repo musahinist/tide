@@ -1,0 +1,29 @@
+[package]
+name = "tide"
+version = "0.1.0"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+tauri = { version = "2.12", features = [] }
+# "tracing-subscriber-utils" is required: librqbit 9.0.1 with only "http-api" fails to
+# compile (E0599 api_log_lines_stream). With it, Api::new takes 3 args.
+librqbit = { version = "=9.0.1", features = ["http-api", "tracing-subscriber-utils"] }
+librqbit-dualstack-sockets = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+urlencoding = "2"
+tauri-plugin-deep-link = "2"
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+
+[profile.dev.package."*"]
+opt-level = 2
