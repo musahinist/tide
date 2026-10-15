@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod artwork;
 mod engine;
 mod macos;
 mod player;
@@ -77,7 +78,7 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,librqbit_upnp=debug")),
         )
         .init();
 
@@ -154,6 +155,8 @@ fn main() -> anyhow::Result<()> {
             engine::reveal_torrent,
             engine::list_files,
             engine::get_download_dir,
+            // artwork
+            artwork::get_artwork,
             // player (WP3)
             player::play_media,
             player::player_current,

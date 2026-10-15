@@ -280,3 +280,43 @@ body.adding #plus { transform: rotate(45deg); }
 
 ::-webkit-scrollbar { width: 8px; }
 ::-webkit-scrollbar-thumb { background: #444; border-radius: 4px; border: 2px solid var(--bg); }
+
+/* ---------- artwork (local poster) ---------- */
+.head { overflow: hidden; isolation: isolate; transition: background .15s, padding-left .3s ease; }
+.head .art {
+  position: absolute;
+  inset: -24px;
+  z-index: -2;
+  background: center 30% / cover no-repeat;
+  filter: blur(20px) saturate(1.25) brightness(.6);
+  opacity: 0;
+  transition: opacity .6s ease;
+  pointer-events: none;
+}
+/* Keeps the text side dark and readable; the art shows mostly at the left. */
+.head.has-art::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: linear-gradient(to right, rgba(42, 42, 42, .2), rgba(42, 42, 42, .7) 45%, rgba(42, 42, 42, .88));
+  pointer-events: none;
+}
+.head.art-on .art { opacity: .55; }
+.head.has-art { padding-left: 66px; }
+.thumb {
+  position: absolute;
+  left: 20px;
+  top: 13px;
+  width: 32px;
+  height: 48px;
+  object-fit: cover;
+  border-radius: 4px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .45), 0 0 0 .5px rgba(255, 255, 255, .08);
+  opacity: 0;
+  transform: scale(.94);
+  transition: opacity .45s ease, transform .45s ease;
+}
+.head.art-on .thumb { opacity: 1; transform: none; }
+.head.has-art .ctl { background: linear-gradient(to right, transparent, rgba(47, 47, 47, .92) 40px); }
+.head.has-art:hover::before, .head.has-art.hl::before { background: linear-gradient(to right, rgba(47, 47, 47, .2), rgba(47, 47, 47, .78) 55%); }

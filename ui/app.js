@@ -211,7 +211,8 @@ function createRow(key) {
   r.revealBtn = iconBtn('folder', 'Show in Finder', () => invoke('reveal_torrent', { key }).catch(reportError));
   ctl.append(r.playBtn, r.pauseBtn, r.resumeBtn, r.revealBtn, iconBtn('remove', 'Remove', () => askRemove(r.last)));
 
-  head.append(name, stats, ctl, bar);
+  r.art = h('div', 'art');
+  head.append(r.art, name, stats, ctl, bar);
   head.addEventListener('click', () => toggle(key));
   el.append(head);
   return r;
@@ -232,6 +233,7 @@ function updateRow(r, t) {
   r.resumeBtn.hidden = !(t.state === 'paused' || (t.state === 'error' && ready));
   r.revealBtn.hidden = !t.output_path;
   r.last = t;
+  wantArtwork(t);
 }
 
 function render(list) {
@@ -248,10 +250,60 @@ function render(list) {
     prev = r.el;
   }
   for (const [key, r] of rows) {
-    if (!seen.has(key)) { r.el.remove(); rows.delete(key); expanded.delete(key); }
+    if (!seen.has(key)) { r.el.remove(); rows.delete(key); expanded.delete(key); art.delete(key); }
   }
+  pumpArtwork();
   $('empty').hidden = list.length > 0;
   for (const key of expanded) loadFiles(key);
+}
+
+// ---------- artwork (local poster shipped inside the torrent) ----------
+// key -> { done, busy, tries, next }. One get_artwork per row; NOT_READY / errors
+// retry with backoff (3 s, 6 s, … capped at 60 s); stops once found or the backend
+// reports "metadata known, no image" (poster: null).
+const art = new Map();
+const ART_MAX = 2;
+let artBusy = 0;
+
+function wantArtwork(t) {
+  if (!art.has(t.key)) art.set(t.key, { done: false, busy: false, tries: 0, next: 0 });
+  const a = art.get(t.key);
+  a.eligible = t.state !== 'resolving' && t.id != null;
+}
+
+function pumpArtwork() {
+  const now = Date.now();
+  for (const [key, a] of art) {
+    if (artBusy >= ART_MAX) return;
+    if (a.done || a.busy || !a.eligible || now < a.next) continue;
+    a.busy = true; artBusy++;
+    invoke('get_artwork', { key }).then((res) => {
+      a.done = true;
+      if (res && res.poster) showArtwork(key, res);
+    }, (e) => {
+      a.tries++;
+      a.next = Date.now() + Math.min(60e3, 3e3 * 2 ** (a.tries - 1));
+      if (errCode(e) === 'NOT_FOUND') a.done = true;
+    }).finally(() => { a.busy = false; artBusy--; pumpArtwork(); });
+  }
+}
+
+function showArtwork(key, res) {
+  const r = rows.get(key);
+  if (!r || r.thumb) return;
+  const img = new Image();
+  img.className = 'thumb';
+  img.alt = '';
+  img.draggable = false;
+  img.onload = () => {
+    if (!rows.has(key)) return;
+    r.thumb = img;
+    r.art.style.backgroundImage = `url("${res.poster}")`;
+    r.head.insertBefore(img, r.name);
+    r.head.classList.add('has-art', res.kind === 'backdrop' ? 'k-backdrop' : 'k-poster');
+    requestAnimationFrame(() => requestAnimationFrame(() => r.head.classList.add('art-on')));
+  };
+  img.src = res.poster;
 }
 
 // ---------- file list ----------
@@ -381,6 +433,28 @@ var MOCK = T ? null : (() => {
     },
     play_media: ({ media }) => (/\.mkv$/i.test(files[media.key][media.fileIndex][0]) ? err('VLC_NOT_FOUND: VLC is not installed') : null),
     open_external: () => null,
+    get_artwork: ({ key }) => {
+      const t = find(key);
+      if (!t) return err('NOT_FOUND: no such torrent');
+      if (t.state === 'resolving') return err('NOT_READY: metadata not resolved yet');
+      const p = MOCK_POSTERS[key];
+      return new Promise((res) => setTimeout(() => res(p ? { poster: p, kind: 'poster' } : { poster: null, kind: null }), 400));
+    },
+  };
+
+  const svgUrl = (body) => `data:image/svg+xml;utf8,${encodeURIComponent(
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 300">${body}</svg>`)}`;
+  const MOCK_POSTERS = {
+    [hash(1)]: svgUrl(`<defs><linearGradient id="s" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#7ec8f0"/><stop offset=".7" stop-color="#d9f1c8"/></linearGradient></defs>
+      <rect width="200" height="300" fill="url(#s)"/><circle cx="150" cy="70" r="26" fill="#ffe27a"/>
+      <path d="M0 210 Q60 160 120 200 T200 190 V300 H0z" fill="#6dbb4f"/><path d="M0 240 Q80 205 200 245 V300 H0z" fill="#3f8f3a"/>
+      <ellipse cx="100" cy="222" rx="30" ry="24" fill="#f4f1ea"/><ellipse cx="88" cy="186" rx="7" ry="24" fill="#f4f1ea"/><ellipse cx="110" cy="186" rx="7" ry="24" fill="#f4f1ea"/>
+      <text x="100" y="278" text-anchor="middle" font-family="Helvetica" font-weight="700" font-size="22" fill="#fff">BIG BUCK BUNNY</text>`),
+    [hash(2)]: svgUrl(`<defs><linearGradient id="s" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#1b2440"/><stop offset=".6" stop-color="#8a4b2a"/><stop offset="1" stop-color="#e2a35a"/></linearGradient></defs>
+      <rect width="200" height="300" fill="url(#s)"/><circle cx="100" cy="190" r="60" fill="#f2c27a" opacity=".55"/>
+      <path d="M40 120 L100 150 L160 112 L120 160 L150 200 L100 172 L52 205 L80 160z" fill="#1a1414"/>
+      <path d="M0 260 L50 220 L90 250 L140 210 L200 255 V300 H0z" fill="#120d0c"/>
+      <text x="100" y="60" text-anchor="middle" font-family="Georgia" font-size="34" letter-spacing="6" fill="#f6e3c4">SINTEL</text>`),
   };
 
   // Preview flags.
