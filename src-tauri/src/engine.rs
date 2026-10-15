@@ -13,13 +13,13 @@ use librqbit::api::TorrentIdOrHash;
 use librqbit::dht::Id20;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Magnet, ManagedTorrent, ManagedTorrentState,
-    TorrentStatsState,
+    Session, TorrentStatsState,
 };
 use tauri::State;
 use tokio::io::AsyncReadExt;
 
 use crate::state::{AppState, PendingMagnet};
-use crate::types::{AddMagnetResult, FileKind, FileRow, TorrentRow, TorrentState};
+use crate::types::{AddMagnetResult, FileKind, FileRow, TorrentDetails, TorrentRow, TorrentState};
 
 type St<'a> = State<'a, Arc<AppState>>;
 type Handle = Arc<ManagedTorrent>;
@@ -461,6 +461,117 @@ fn with_extra_trackers(magnet: &str, existing: &[String]) -> String {
     out
 }
 
+// ---------------------------------------------------------------- same-name collisions
+
+/// Names our metadata feature writes into a torrent folder (not "foreign" content).
+const SIDECAR_NAMES: &[&str] = &["tide.json", ".tide.json.tmp", "poster.jpg", "fanart.jpg", "movie.nfo", "tvshow.nfo"];
+
+/// "Sintel" -> first of "Sintel (2)", "Sintel (3)", … that is not `taken`.
+pub fn unique_name(base: &str, taken: impl Fn(&str) -> bool) -> String {
+    (2u32..)
+        .map(|n| format!("{base} ({n})"))
+        .find(|c| !taken(c))
+        .expect("unbounded range")
+}
+
+/// Does the existing `target` look like an earlier download of this same torrent
+/// (resume/seed it in place) rather than someone else's files?
+fn same_content(target: &Path, single: bool, files: &[(PathBuf, u64)], info_hash: &str) -> bool {
+    if single {
+        return std::fs::metadata(target).is_ok_and(|m| m.is_file() && m.len() <= files[0].1);
+    }
+    if let Ok(b) = std::fs::read(target.join("tide.json")) {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&b) {
+            if v.get("key").and_then(|k| k.as_str()) == Some(info_hash) {
+                return true;
+            }
+        }
+    }
+    let tops: std::collections::HashSet<String> = files
+        .iter()
+        .filter_map(|(p, _)| p.components().next().map(|c| c.as_os_str().to_string_lossy().into_owned()))
+        .collect();
+    let Ok(rd) = std::fs::read_dir(target) else { return false };
+    for e in rd.flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if !(tops.contains(&n) || n.starts_with('.') || SIDECAR_NAMES.contains(&n.to_lowercase().as_str())) {
+            return false;
+        }
+    }
+    files.iter().all(|(p, len)| std::fs::metadata(target.join(p)).map_or(true, |m| m.len() <= *len))
+}
+
+/// Pick the output folder for a resolved torrent: its default one, unless that path is
+/// used by another torrent in the session or holds different content on disk; then a
+/// unique sibling folder "Name (2)" (single-file torrents get a folder named after the file).
+fn choose_output_folder(session: &Session, default_folder: &Path, files: &[(PathBuf, u64)], info_hash: &str) -> PathBuf {
+    let single = files.len() == 1;
+    let target = if single { default_folder.join(&files[0].0) } else { default_folder.to_path_buf() };
+    let used_by_other = |p: &Path| {
+        session.with_torrents(|it| {
+            it.filter(|(_, h)| {
+                h.info_hash().as_string() != info_hash && (output_path(h) == p || h.output_folder() == p)
+            })
+            .count()
+                > 0
+        })
+    };
+    let clash = used_by_other(&target) || (target.exists() && !same_content(&target, single, files, info_hash));
+    if !clash {
+        return default_folder.to_path_buf();
+    }
+    let parent = target.parent().unwrap_or(default_folder).to_path_buf();
+    let base = if single {
+        target.file_stem().map(|s| s.to_string_lossy().into_owned())
+    } else {
+        target.file_name().map(|s| s.to_string_lossy().into_owned())
+    }
+    .unwrap_or_else(|| "Download".into());
+    let name = unique_name(&base, |c| {
+        let p = parent.join(c);
+        p.exists() || used_by_other(&p) || (single && used_by_other(&p.join(&files[0].0)))
+    });
+    tracing::info!(target = %target.display(), chosen = %name, "output path taken by other content; using a unique folder");
+    parent.join(name)
+}
+
+/// Resolve the magnet (list_only), choose a non-clashing output folder, then add the
+/// torrent from the resolved metadata (no second resolve; seen peers are reused).
+async fn resolve_and_add(session: &Arc<Session>, magnet: String) -> anyhow::Result<AddTorrentResponse> {
+    let lo = session
+        .add_torrent(
+            AddTorrent::from_url(magnet),
+            Some(AddTorrentOptions { list_only: true, ..Default::default() }),
+        )
+        .await?;
+    let lo = match lo {
+        AddTorrentResponse::ListOnly(lo) => lo,
+        other => return Ok(other),
+    };
+    let info_hash = lo.info_hash.as_string();
+    if let Some(h) = session.get(TorrentIdOrHash::Hash(lo.info_hash)) {
+        return Ok(AddTorrentResponse::AlreadyManaged(h.id(), h));
+    }
+    let files: Vec<(PathBuf, u64)> = lo
+        .info
+        .iter_file_details()
+        .filter(|d| !d.attrs().padding)
+        .map(|d| (d.filename.to_pathbuf(), d.len))
+        .collect();
+    let folder = choose_output_folder(session, &lo.output_folder, &files, &info_hash);
+    if let Some(parent) = folder.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let opts = AddTorrentOptions {
+        overwrite: true,
+        output_folder: Some(folder.to_string_lossy().into_owned()),
+        only_files: lo.only_files.clone(),
+        initial_peers: Some(lo.seen_peers.clone()),
+        ..Default::default()
+    };
+    session.add_torrent(AddTorrent::from_bytes(lo.torrent_bytes), Some(opts)).await
+}
+
 /// Shared by the `add_magnet` command and the magnet: deep-link handler.
 /// Returns immediately; metadata is resolved by a background task tracked in
 /// `AppState.pending`.
@@ -512,14 +623,12 @@ pub async fn add_magnet_internal(st: &AppState, magnet: &str) -> Result<AddMagne
     let task_key = key.clone();
     let stored_magnet = magnet.clone();
     let magnet = with_extra_trackers(&magnet, &parsed.trackers);
+    // The user may have deleted ~/Downloads/Tidebox while the app runs.
+    if let Err(e) = std::fs::create_dir_all(&st.download_dir) {
+        return Err(internal(format!("create {}: {e}", st.download_dir.display())));
+    }
     let task = tokio::spawn(async move {
-        let opts = AddTorrentOptions {
-            overwrite: true,
-            ..Default::default()
-        };
-        let res = session
-            .add_torrent(AddTorrent::from_url(magnet), Some(opts))
-            .await;
+        let res = resolve_and_add(&session, magnet).await;
         match res {
             Ok(AddTorrentResponse::Added(id, _)) => {
                 tracing::info!(key = %task_key, id, "magnet resolved and added")
@@ -633,11 +742,29 @@ async fn remove(state: &AppState, key: &str, delete_files: bool) -> Result<(), S
 
     // Also covers a resolve task that finished right before the abort.
     if state.session.get(TorrentIdOrHash::Hash(id)).is_some() {
+        // Collected before forgetting the torrent (needs its row + file list).
+        let (sidecars, folder) = if delete_files {
+            crate::metadata::sidecar_paths(state, &k)
+        } else {
+            (vec![], None)
+        };
         state
             .session
             .delete(TorrentIdOrHash::Hash(id), delete_files)
             .await
             .map_err(|e| internal(format!("remove failed: {e:#}")))?;
+        for p in sidecars {
+            if let Err(e) = std::fs::remove_file(&p) {
+                tracing::warn!("removing sidecar {} failed: {e}", p.display());
+            }
+        }
+        // librqbit only deletes torrent-owned files; drop the folder if it is now empty
+        // (non-recursive: fails harmlessly when anything else is left).
+        if let Some(f) = folder {
+            let _ = std::fs::remove_file(f.join(".DS_Store"));
+            let _ = std::fs::remove_dir(&f);
+        }
+        crate::metadata::forget(state, &k);
         return Ok(());
     }
     if was_pending {
@@ -678,9 +805,45 @@ pub fn list_files(state: St<'_>, key: String) -> Result<Vec<FileRow>, String> {
     files(&state, &key)
 }
 
+/// `~/Downloads/Tidebox` (re-created if the user deleted it).
 #[tauri::command]
 pub fn get_download_dir(state: St<'_>) -> Result<String, String> {
+    let _ = std::fs::create_dir_all(&state.download_dir);
     Ok(state.download_dir.to_string_lossy().into_owned())
+}
+
+fn magnet_for(info_hash: &str, name: Option<&str>, trackers: &[String]) -> String {
+    let mut m = format!("magnet:?xt=urn:btih:{info_hash}");
+    if let Some(n) = name.filter(|n| !n.is_empty()) {
+        m.push_str("&dn=");
+        m.push_str(&urlencoding::encode(n));
+    }
+    for t in trackers {
+        m.push_str("&tr=");
+        m.push_str(&urlencoding::encode(t));
+    }
+    m
+}
+
+/// Detail panel "More": info hash, magnet link, tracker count, save path.
+#[tauri::command]
+pub fn get_torrent_details(state: St<'_>, key: String) -> Result<TorrentDetails, String> {
+    let id = parse_key(&key)?;
+    let k = id.as_string();
+    if let Some(h) = state.session.get(TorrentIdOrHash::Hash(id)) {
+        let mut trackers: Vec<String> = h.shared().trackers.iter().map(|u| u.to_string()).collect();
+        trackers.sort();
+        return Ok(TorrentDetails {
+            magnet: magnet_for(&k, h.name().as_deref(), &trackers),
+            info_hash: k,
+            trackers: trackers.len(),
+            save_path: Some(output_path(&h).to_string_lossy().into_owned()),
+        });
+    }
+    let pending = state.pending.lock().unwrap();
+    let p = pending.get(&k).ok_or_else(|| not_found(format!("no torrent {k}")))?;
+    let trackers = Magnet::parse(&p.magnet).map(|m| m.trackers.len()).unwrap_or(0);
+    Ok(TorrentDetails { info_hash: k, magnet: p.magnet.clone(), trackers, save_path: None })
 }
 
 #[cfg(test)]
@@ -695,6 +858,49 @@ mod tests {
         assert_eq!(kind_of("x.ogg"), (FileKind::Audio, false));
         assert_eq!(kind_of("x.srt"), (FileKind::Subtitle, false));
         assert_eq!(kind_of("README"), (FileKind::Other, false));
+    }
+
+    #[test]
+    fn unique_names() {
+        let taken = ["Sintel (2)", "Sintel (3)"];
+        assert_eq!(unique_name("Sintel", |c| taken.contains(&c)), "Sintel (4)");
+        assert_eq!(unique_name("Sintel", |_| false), "Sintel (2)");
+        assert_eq!(unique_name("Big Buck Bunny (2008)", |_| false), "Big Buck Bunny (2008) (2)");
+    }
+
+    #[test]
+    fn same_content_rules() {
+        let d = std::env::temp_dir().join(format!("tide-engine-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let t = d.join("Movie");
+        std::fs::create_dir_all(t.join("Subs")).unwrap();
+        std::fs::write(t.join("Movie.mkv"), vec![0u8; 10]).unwrap();
+        std::fs::write(t.join("Subs/en.srt"), b"1").unwrap();
+        std::fs::write(t.join("tide.json"), br#"{"key":"other"}"#).unwrap();
+        std::fs::write(t.join(".DS_Store"), b"").unwrap();
+        let files = vec![(PathBuf::from("Movie.mkv"), 100), (PathBuf::from("Subs/en.srt"), 5)];
+        assert!(same_content(&t, false, &files, "abc"), "torrent files + sidecars + hidden");
+        std::fs::write(t.join("notes.doc"), b"x").unwrap();
+        assert!(!same_content(&t, false, &files, "abc"), "foreign file");
+        std::fs::write(t.join("tide.json"), br#"{"key":"abc"}"#).unwrap();
+        assert!(same_content(&t, false, &files, "abc"), "our tide.json says it's this torrent");
+        std::fs::remove_file(t.join("tide.json")).unwrap();
+        std::fs::remove_file(t.join("notes.doc")).unwrap();
+        assert!(!same_content(&t, false, &[(PathBuf::from("Movie.mkv"), 5), (PathBuf::from("Subs/en.srt"), 5)], "abc"), "bigger than expected");
+        let f = d.join("single.mkv");
+        std::fs::write(&f, vec![0u8; 10]).unwrap();
+        assert!(same_content(&f, true, &[(PathBuf::from("single.mkv"), 10)], "abc"));
+        assert!(!same_content(&f, true, &[(PathBuf::from("single.mkv"), 9)], "abc"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn magnet_link() {
+        let m = magnet_for("08ada5a7a6183aae1e09d831df6748d566095a10", Some("Sintel & co"), &["udp://a.b:1/announce".into()]);
+        assert_eq!(m, "magnet:?xt=urn:btih:08ada5a7a6183aae1e09d831df6748d566095a10&dn=Sintel%20%26%20co&tr=udp%3A%2F%2Fa.b%3A1%2Fannounce");
+        let p = Magnet::parse(&m).unwrap();
+        assert_eq!(p.name.as_deref(), Some("Sintel & co"));
+        assert_eq!(p.trackers, vec!["udp://a.b:1/announce".to_string()]);
     }
 
     #[test]

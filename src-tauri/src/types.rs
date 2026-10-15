@@ -110,3 +110,57 @@ pub struct AddMagnetResult {
     pub name: String,
     pub already_exists: bool,
 }
+
+// ---------------------------------------------------------------- metadata (WP6)
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaType {
+    #[default]
+    Movie,
+    Tv,
+}
+
+/// Movie / TV info for a torrent (source: Cinemeta, keyed by IMDb id). Persisted in the
+/// `tide.json` sidecar, so every field has a serde default.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MediaInfo {
+    /// IMDb id ("tt0133093"); empty when `needs_match`.
+    pub imdb_id: String,
+    pub media_type: MediaType,
+    pub title: String,
+    pub year: Option<u16>,
+    /// As shown by the source, e.g. "1999" or "2008–2013".
+    pub release_info: Option<String>,
+    pub overview: String,
+    /// Remote poster (search tiles only; matched rows use the sidecar via `get_media_image`).
+    pub poster_url: Option<String>,
+    pub genres: Vec<String>,
+    pub runtime_min: Option<u32>,
+    /// https://www.imdb.com/title/{imdb_id}/
+    pub imdb_url: Option<String>,
+    pub imdb_rating: Option<f32>,
+    pub season: Option<u32>,
+    pub episode: Option<u32>,
+    pub episode_title: Option<String>,
+    pub episode_overview: Option<String>,
+    /// Daily shows: YYYY-MM-DD parsed from the name.
+    pub air_date: Option<String>,
+    /// The user picked this match (never auto-overwritten).
+    pub manual: bool,
+    /// No confident automatic match: `title`/`year`/`season`/`episode` hold the parsed
+    /// name (search prefill) and the UI offers "Eşleştir".
+    pub needs_match: bool,
+    /// Why it was (not) auto-matched, e.g. "similarity 0.72; year 2010 vs 2014".
+    pub match_note: Option<String>,
+}
+
+/// Return value of `get_torrent_details` (detail panel "More" section).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TorrentDetails {
+    pub info_hash: String,
+    pub magnet: String,
+    pub trackers: usize,
+    pub save_path: Option<String>,
+}

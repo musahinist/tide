@@ -1,4 +1,29 @@
-# Tide — FEATURE: movie/TV metadata (TMDB) — implementation plan
+# Tide — FEATURE: movie/TV metadata — IMPLEMENTED (2026-10-15)
+
+## As built (supersedes the TMDB plan below where they differ)
+- **Source: Cinemeta** (Stremio's public, keyless metadata API; English) — no API key, no settings, no TMDB code, no IMDb dataset download. Images from metahub.space. Credit: Stremio/Cinemeta + metahub.
+  - search `GET https://v3-cinemeta.strem.io/catalog/{movie|series}/top/search={q}.json`, details `GET /meta/{movie|series}/{tt}.json` (imdbRating, genres, runtime, description, poster, background, series `videos` with season/episode/name/overview).
+  - Uncached searches take ~10–12 s on Cinemeta's side and sporadically return 500/504: searches use a 20 s timeout, meta/images 10 s, one retry after 1.5 s; a failed search never produces a cached "miss"/"needs_match" (retried later). Max 2 concurrent lookups; User-Agent `Tide/0.1 (+https://github.com/musahinist/tide)`.
+- **Code:** `src-tauri/src/nameparse.rs` (parser, ≥59-case table, `is_extra`, similarity, `confidence`), `src-tauri/src/metadata.rs` (Cinemeta client, ladder, sidecars, negative cache, commands).
+- **Pipeline:** IMDb `tt` id from the torrent's .nfo/.txt (≤256 KB) → exact `/meta`; else candidate names (torrent name, main video, its folder) → variants (title, AKA side, title minus last word) × type (tv first if S/E markers) — max 8 searches. Auto-accept: similarity ≥ 0.85 + year ±1, or ≥ 0.95 + no year + no equally strong rival (TV: exact unique title also passes with a mismatched year). Country hint (US/UK…) breaks ties via `meta.country`. Collections → needs_match. Non-video / < 50 MB video / samples only → no lookup.
+- **Sidecars** (`tide.json`, `poster.jpg`, `fanart.jpg`, `movie.nfo`/`tvshow.nfo`; single-file: `<stem>.tide.json`, `<stem>-poster.jpg`, `<stem>-fanart.jpg`, `<stem>.nfo` with `<episodedetails>` for episodes). Posters (WebP from metahub) and large backgrounds are converted/downscaled to JPEG with `/usr/bin/sips`. Torrent-owned names are never written. `data_dir/metadata.json` holds `misses` and `needs` (24 h).
+- **IPC** (types in types.rs: `MediaType`, `MediaInfo`, `TorrentDetails`):
+
+| command | JS args | returns |
+|---|---|---|
+| `get_media_info` | `{key}` | `MediaInfo \| null` (`needs_match: true` → prefill + "Eşleştir"); errors `NOT_READY` (resolving / waiting for files), `NOT_FOUND`, `INTERNAL` (network: retry later) |
+| `get_media_image` | `{key, kind:"poster"\|"backdrop"}` | data URL of the sidecar (`NOT_FOUND` if none) |
+| `search_media` | `{query, mediaType:"movie"\|"tv"\|null}` | `MediaInfo[]` (top 8; `tt…`/imdb.com URL resolves directly) |
+| `set_media_match` | `{key, imdbId, mediaType}` | `MediaInfo` (manual=true, sidecars rewritten) |
+| `clear_media_match` | `{key}` | `null` |
+| `get_torrent_details` | `{key}` | `{info_hash, magnet, trackers, save_path}` |
+
+- `remove_torrent` with `deleteFiles` also deletes the sidecars and removes the now-empty torrent folder.
+
+---
+
+# Original plan (TMDB-based; kept for reference)
+
 
 Status: PLANNED, not implemented. Nothing in the project has been changed for this feature.
 Read PLAN.md first for the IPC conventions: JS args are camelCase, JSON is snake_case, and errors are `"CODE: msg"`.

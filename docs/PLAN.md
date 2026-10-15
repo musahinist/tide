@@ -21,7 +21,7 @@
   - Everything else opens in VLC automatically, as do files that fail at runtime.
 - Subtitles from inside the torrent are attached automatically.
 - Session persistence.
-- ~/Downloads as the download folder.
+- ~/Downloads/Tidebox as the download folder (created at start and before each add). A name already used by different content gets a unique sibling folder, e.g. "Sintel (2)".
 - Unsigned .app build.
 
 **Also in scope (added later):** default macOS handler for magnet: links (Chrome click → app opens and adds the torrent). WP0 sets it up with tauri-plugin-deep-link + LSSetDefaultHandlerForURLScheme in src/macos.rs; engine.rs exposes `pub async fn add_magnet_internal(st:&AppState, magnet:&str)`, which the `add_magnet` command and the deep-link handler both call (WP1 implements it).
@@ -90,7 +90,7 @@ opt-level = 2
 ## main.rs flow
 1. Build a tokio multi-thread runtime `rt`, then call `tauri::async_runtime::set(rt.handle().clone())`. Keep `rt` alive for the whole program.
 2. `let st = Arc::new(rt.block_on(state::init())?)`. `init` sets up:
-   - download_dir = `$HOME/Downloads` (create it if missing)
+   - download_dir = `$HOME/Downloads/Tidebox` (create it if missing; re-created before each add_magnet)
    - data_dir = `~/Library/Application Support/com.musahinist.tide`, with `session/` and `subs/` subfolders
    - Session: `Session::new_with_opts(download_dir, SessionOptions{ persistence: Some(SessionPersistenceConfig::Json{folder: Some(data_dir/session)}), fastresume: true, ..Default::default() })`
    - Api: `Api::new(session.clone(), None)` (2 args)

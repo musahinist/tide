@@ -165,7 +165,8 @@ pub fn pick_best(files: &[Candidate<'_>], torrent_name: &str) -> Option<(usize, 
 
 /// Sidecar images next to a single-file torrent: `<stem>-poster.jpg`, `<stem>.jpg`, …
 /// and — only when the file lives in its own folder (not the shared download dir) —
-/// `poster.jpg` / `cover.jpg` / `folder.jpg`.
+/// `poster.jpg` / `cover.jpg` / `folder.jpg`. (Tide's own `<stem>-poster.jpg` sidecar is
+/// preferred by the UI via `get_media_image` anyway.)
 fn sidecar_candidates(file: &Path, download_dir: &Path) -> Vec<PathBuf> {
     let (Some(dir), Some(stem)) = (file.parent(), file.file_stem()) else {
         return vec![];
@@ -177,7 +178,8 @@ fn sidecar_candidates(file: &Path, download_dir: &Path) -> Vec<PathBuf> {
         names.push(format!("{stem}.poster.{ext}"));
         names.push(format!("{stem}.{ext}"));
     }
-    if dir != download_dir {
+    // Shared folders: ~/Downloads/Tidebox, and ~/Downloads (torrents added before Tidebox).
+    if dir != download_dir && Some(dir) != download_dir.parent() {
         for base in ["poster", "cover", "folder"] {
             for ext in IMAGE_EXT {
                 names.push(format!("{base}.{ext}"));
@@ -195,7 +197,7 @@ fn mime(name: &str) -> &'static str {
     }
 }
 
-fn base64(data: &[u8]) -> String {
+pub(crate) fn base64(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for c in data.chunks(3) {

@@ -3,6 +3,8 @@
 mod artwork;
 mod engine;
 mod macos;
+mod metadata;
+mod nameparse;
 mod player;
 mod state;
 mod subtitles;
@@ -155,8 +157,15 @@ fn main() -> anyhow::Result<()> {
             engine::reveal_torrent,
             engine::list_files,
             engine::get_download_dir,
+            engine::get_torrent_details,
             // artwork
             artwork::get_artwork,
+            // metadata (WP6)
+            metadata::get_media_info,
+            metadata::get_media_image,
+            metadata::search_media,
+            metadata::set_media_match,
+            metadata::clear_media_match,
             // player (WP3)
             player::play_media,
             player::player_current,

@@ -20,6 +20,8 @@ pub struct AppState {
     pub pending: std::sync::Mutex<HashMap<String, PendingMagnet>>,
     /// WP3 fills; Default.
     pub player: crate::player::PlayerState,
+    /// WP6 movie/TV metadata; Default.
+    pub meta: crate::metadata::MetaState,
 }
 
 #[allow(dead_code)]
@@ -67,12 +69,18 @@ fn pick_peer_port() -> u16 {
     0
 }
 
+/// All new downloads go to `~/Downloads/Tidebox` (torrents added earlier keep the output
+/// folder librqbit persisted for them).
+pub fn download_dir_for(home: &std::path::Path) -> PathBuf {
+    home.join("Downloads").join("Tidebox")
+}
+
 /// Must be called inside the tokio runtime (binding needs a reactor).
 pub async fn init() -> anyhow::Result<AppState> {
     let home = std::env::var_os("HOME").context("HOME not set")?;
     let home = PathBuf::from(home);
 
-    let download_dir = home.join("Downloads");
+    let download_dir = download_dir_for(&home);
     std::fs::create_dir_all(&download_dir).context("create download dir")?;
 
     let data_dir = home.join("Library/Application Support/com.musahinist.tide");
@@ -121,8 +129,11 @@ pub async fn init() -> anyhow::Result<AppState> {
         "http_api",
         HttpApi::new(
             api.clone(),
+            // read_only: Tide only needs GET /torrents/{id}/stream/...; all mutations go
+            // through Session/Api directly. With read_only:false any web page could POST
+            // /torrents?output_folder=<anywhere> (no-cors simple request) or /delete.
             Some(HttpApiOptions {
-                read_only: false,
+                read_only: true,
                 ..Default::default()
             }),
         )
@@ -137,5 +148,6 @@ pub async fn init() -> anyhow::Result<AppState> {
         data_dir,
         pending: std::sync::Mutex::new(HashMap::new()),
         player: Default::default(),
+        meta: Default::default(),
     })
 }
