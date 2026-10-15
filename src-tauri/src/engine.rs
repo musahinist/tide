@@ -565,12 +565,10 @@ fn same_content(target: &Path, single: bool, files: &[(PathBuf, u64)], info_hash
     files.iter().all(|(p, len)| std::fs::metadata(target.join(p)).map_or(true, |m| m.len() <= *len))
 }
 
-/// Pick the output folder for a resolved torrent: its default one, unless that path is
-/// used by another torrent in the session or holds different content on disk; then a
-/// unique sibling folder "Name (2)" (single-file torrents get a folder named after the file).
-fn choose_output_folder(session: &Session, default_folder: &Path, files: &[(PathBuf, u64)], info_hash: &str) -> PathBuf {
-    let single = files.len() == 1;
-    let target = if single { default_folder.join(&files[0].0) } else { default_folder.to_path_buf() };
+/// Pick the output folder for a resolved torrent: every torrent gets its own folder
+/// `Tidebox/<clean name>` (single files go inside it). If that folder is used by another
+/// torrent or holds different content on disk, a unique sibling "Name (2)".
+fn choose_output_folder(session: &Session, tidebox: &Path, base: &str, files: &[(PathBuf, u64)], info_hash: &str) -> PathBuf {
     let used_by_other = |p: &Path| {
         session.with_torrents(|it| {
             it.filter(|(_, h)| {
@@ -580,28 +578,22 @@ fn choose_output_folder(session: &Session, default_folder: &Path, files: &[(Path
                 > 0
         })
     };
-    let clash = used_by_other(&target) || (target.exists() && !same_content(&target, single, files, info_hash));
+    let target = tidebox.join(base);
+    let clash = used_by_other(&target) || (target.exists() && !same_content(&target, false, files, info_hash));
     if !clash {
-        return default_folder.to_path_buf();
+        return target;
     }
-    let parent = target.parent().unwrap_or(default_folder).to_path_buf();
-    let base = if single {
-        target.file_stem().map(|s| s.to_string_lossy().into_owned())
-    } else {
-        target.file_name().map(|s| s.to_string_lossy().into_owned())
-    }
-    .unwrap_or_else(|| "Download".into());
-    let name = unique_name(&base, |c| {
-        let p = parent.join(c);
-        p.exists() || used_by_other(&p) || (single && used_by_other(&p.join(&files[0].0)))
+    let name = unique_name(base, |c| {
+        let p = tidebox.join(c);
+        p.exists() || used_by_other(&p)
     });
-    tracing::info!(target = %target.display(), chosen = %name, "output path taken by other content; using a unique folder");
-    parent.join(name)
+    tracing::info!(target = %target.display(), chosen = %name, "output folder taken by other content; using a unique folder");
+    tidebox.join(name)
 }
 
 /// Resolve the magnet (list_only), choose a non-clashing output folder, then add the
 /// torrent from the resolved metadata (no second resolve; seen peers are reused).
-async fn resolve_and_add(session: &Arc<Session>, magnet: String) -> anyhow::Result<AddTorrentResponse> {
+async fn resolve_and_add(session: &Arc<Session>, tidebox: &Path, magnet: String) -> anyhow::Result<AddTorrentResponse> {
     let lo = session
         .add_torrent(
             AddTorrent::from_url(magnet),
@@ -622,10 +614,15 @@ async fn resolve_and_add(session: &Arc<Session>, magnet: String) -> anyhow::Resu
         .filter(|d| !d.attrs().padding)
         .map(|d| (d.filename.to_pathbuf(), d.len))
         .collect();
-    let folder = choose_output_folder(session, &lo.output_folder, &files, &info_hash);
-    if let Some(parent) = folder.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    // Default folder of a multi-file torrent is <session dir>/<torrent name>.
+    let single = files.len() == 1;
+    let base = if single {
+        folder_base(&files[0].0, true)
+    } else {
+        folder_base(&lo.output_folder, false)
+    };
+    let folder = choose_output_folder(session, tidebox, &base, &files, &info_hash);
+    let _ = std::fs::create_dir_all(&folder);
     let opts = AddTorrentOptions {
         overwrite: true,
         output_folder: Some(folder.to_string_lossy().into_owned()),
@@ -691,8 +688,9 @@ pub async fn add_magnet_internal(st: &AppState, magnet: &str) -> Result<AddMagne
     if let Err(e) = std::fs::create_dir_all(&st.download_dir) {
         return Err(internal(format!("create {}: {e}", st.download_dir.display())));
     }
+    let tidebox = st.download_dir.clone();
     let task = tokio::spawn(async move {
-        let res = resolve_and_add(&session, magnet).await;
+        let res = resolve_and_add(&session, &tidebox, magnet).await;
         match res {
             Ok(AddTorrentResponse::Added(id, _)) => {
                 tracing::info!(key = %task_key, id, "magnet resolved and added")
@@ -734,6 +732,252 @@ pub async fn add_magnet_internal(st: &AppState, magnet: &str) -> Result<AddMagne
         name,
         already_exists: false,
     })
+}
+
+// ---------------------------------------------------------------- folder names
+
+const TLDS: &str = "to|org|com|net|io|me|cc|tv|info|ws|ru|xyz|lol|se|is|in|co|nz|uk|ch|li|pw|vip|club|site|top|biz|eu|am|mx|st|sx|lt|ag|nu";
+
+/// `www.UIndex.org    -    ` / `site.to - ` prefixes and ` - www.site.org` suffixes.
+static SITE_AFFIX: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(&format!(
+        r"(?i)^\s*(?:www\.[\w-]+(?:\.[\w-]+)*\.(?:{TLDS})\s*[-–—|:]?|[\w-]+(?:\.[\w-]+)*\.(?:{TLDS})\s*[-–—|])\s*|\s*[-–—|]\s*(?:www\.)?[\w-]+(?:\.[\w-]+)*\.(?:{TLDS})\s*$"
+    ))
+    .expect("valid regex")
+});
+/// `[EZTVx.to]`, `[ www.site.org ]`, `【site】`, `[eztv]`, `(RARBG)`… anywhere in the name.
+static SITE_TAG: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(&format!(
+        r"(?i)【[^】]*】|[\[(]\s*(?:(?:www\.)?[\w-]+(?:\.[\w-]+)*\.(?:{TLDS})|eztv\w*|ettv|rarbg|tgx|yts(?:\.\w+)?|1337x|torrentgalaxy|glodls)\s*[\])]"
+    ))
+    .expect("valid regex")
+});
+
+/// Folder name for a torrent inside Tidebox: site prefixes/suffixes/tags removed, runs of
+/// whitespace collapsed, `:`/`/`/control chars replaced, no leading dot, ≤ 200 bytes.
+/// Idempotent (so an already-clean folder is never renamed again).
+pub fn clean_folder_name(name: &str) -> String {
+    let mut s: String = name
+        .chars()
+        .map(|c| if c == ':' || c == '/' || c == '\\' { '-' } else if c.is_control() { ' ' } else { c })
+        .collect();
+    loop {
+        let before = s.clone();
+        s = SITE_TAG.replace_all(&s, " ").into_owned();
+        s = SITE_AFFIX.replace_all(&s, "").into_owned();
+        s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+        s = s.trim_matches(|c: char| c.is_whitespace() || c == '-' || c == '_' || c == '|').to_string();
+        s = s.trim_start_matches('.').to_string();
+        if s.len() > 200 {
+            let mut end = 200;
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            s.truncate(end);
+        }
+        if s == before {
+            break;
+        }
+    }
+    if s.is_empty() || s == ".." {
+        "Download".into()
+    } else {
+        s
+    }
+}
+
+/// Base for a torrent's folder name: the torrent folder name, or a single file's stem.
+fn folder_base(name: &Path, single: bool) -> String {
+    let n = if single { name.file_stem() } else { name.file_name() };
+    clean_folder_name(&n.map(|s| s.to_string_lossy().into_owned()).unwrap_or_default())
+}
+
+// ---------------------------------------------------------------- Tidebox migration
+
+/// rename(2); on failure (e.g. another volume) copy recursively, then remove the source.
+fn move_path(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if dst.exists() {
+        return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, format!("{} exists", dst.display())));
+    }
+    if std::fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    fn copy_rec(src: &Path, dst: &Path) -> std::io::Result<()> {
+        if src.is_dir() {
+            std::fs::create_dir(dst)?;
+            for e in std::fs::read_dir(src)? {
+                let e = e?;
+                copy_rec(&e.path(), &dst.join(e.file_name()))?;
+            }
+            Ok(())
+        } else {
+            std::fs::copy(src, dst).map(|_| ())
+        }
+    }
+    if let Err(e) = copy_rec(src, dst) {
+        // Never leave a half copy behind; the source is untouched.
+        let _ = if dst.is_dir() { std::fs::remove_dir_all(dst) } else { std::fs::remove_file(dst) };
+        return Err(e);
+    }
+    if src.is_dir() { std::fs::remove_dir_all(src) } else { std::fs::remove_file(src) }
+}
+
+/// Is this torrent already laid out as `Tidebox/<clean folder>/…`?
+fn in_own_folder(tidebox: &Path, folder: &Path, single: bool) -> bool {
+    if folder.parent() != Some(tidebox) {
+        return false;
+    }
+    // Single-file folders are never renamed once they exist; multi-file ones get the
+    // cleaned name (clean_folder_name is idempotent, "Name (2)" stays).
+    single || folder.file_name().is_some_and(|n| clean_folder_name(&n.to_string_lossy()) == n.to_string_lossy())
+}
+
+/// Startup: give every torrent its own clean folder in `~/Downloads/Tidebox` (older
+/// versions put files in ~/Downloads, single files loose in Tidebox, folders with site
+/// prefixes). Forget the torrent (files kept), move files + our sidecars, re-add it from
+/// its stored .torrent bytes (same info hash: metadata cache / groups / watched still
+/// match; librqbit re-verifies the data, so progress is kept). Any failure leaves (or
+/// puts back) the torrent where it was.
+pub async fn migrate_to_tidebox(st: &AppState) {
+    let tidebox = st.download_dir.clone();
+    let handles: Vec<Handle> = st.session.with_torrents(|it| it.map(|(_, h)| h.clone()).collect());
+    for h in handles {
+        let key = h.info_hash().as_string();
+        match migrate_one(st, &tidebox, &h).await {
+            Ok(Some(to)) => tracing::info!(%key, to = %to.display(), "migrated torrent into its Tidebox folder"),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(%key, "Tidebox migration skipped; torrent left in place: {e}"),
+        }
+    }
+}
+
+/// `<stem>.tide.json` etc. next to a loose single file → folder-style names.
+fn legacy_sidecars(dir: &Path, stem: &str) -> Vec<(PathBuf, String)> {
+    let mut v = vec![];
+    for (old, new) in [
+        (format!("{stem}.tide.json"), "tide.json"),
+        (format!("{stem}-poster.jpg"), "poster.jpg"),
+        (format!("{stem}-fanart.jpg"), "fanart.jpg"),
+    ] {
+        v.push((dir.join(old), new.to_string()));
+    }
+    let nfo = dir.join(format!("{stem}.nfo"));
+    let name = match std::fs::read_to_string(&nfo) {
+        Ok(t) if t.contains("<movie") => "movie.nfo",
+        _ => "tvshow.nfo",
+    };
+    v.push((nfo, name.to_string()));
+    v.into_iter().filter(|(p, _)| p.is_file()).collect()
+}
+
+async fn migrate_one(st: &AppState, tidebox: &Path, h: &Handle) -> Result<Option<PathBuf>, String> {
+    let key = h.info_hash().as_string();
+    let old_folder = h.output_folder().to_path_buf();
+    let (bytes, real) = h
+        .with_metadata(|m| {
+            let real: Vec<PathBuf> =
+                m.file_infos.iter().filter(|f| !f.attrs.padding).map(|f| f.relative_filename.clone()).collect();
+            (m.torrent_bytes.clone(), real)
+        })
+        .map_err(|e| format!("no metadata: {e:#}"))?;
+    let single = real.len() == 1;
+    if in_own_folder(tidebox, &old_folder, single) {
+        return Ok(None);
+    }
+    if bytes.is_empty() {
+        return Err("no stored torrent bytes".into());
+    }
+    let first = |p: &PathBuf| p.components().next().map(|c| PathBuf::from(c.as_os_str()));
+    // What moves: a single file (or its top dir if nested) into the new folder; a
+    // multi-file torrent's folder becomes the new folder.
+    let (src, inner) = if single {
+        let top = first(&real[0]).ok_or("empty file name")?;
+        (old_folder.join(&top), Some(top))
+    } else {
+        // Never move a folder that is (or contains) Tidebox, ~/Downloads or $HOME.
+        if tidebox.starts_with(&old_folder) {
+            return Err(format!("output folder {} contains Tidebox", old_folder.display()));
+        }
+        (old_folder.clone(), None)
+    };
+    if !src.exists() {
+        return Err(format!("{} does not exist", src.display()));
+    }
+    let base = if single { folder_base(&real[0], true) } else { folder_base(&old_folder, false) };
+    let sidecars = match (&inner, real[0].file_stem()) {
+        (Some(_), Some(stem)) => legacy_sidecars(&old_folder, &stem.to_string_lossy()),
+        _ => vec![],
+    };
+    let taken_by_other = |p: &Path| {
+        st.session.with_torrents(|it| {
+            it.filter(|(_, o)| o.info_hash() != h.info_hash() && (output_path(o) == p || o.output_folder() == p)).count() > 0
+        })
+    };
+    let mut new_folder = tidebox.join(&base);
+    if new_folder.exists() || taken_by_other(&new_folder) {
+        new_folder = tidebox.join(unique_name(&base, |c| {
+            let p = tidebox.join(c);
+            p.exists() || taken_by_other(&p)
+        }));
+    }
+    let dst = match &inner {
+        Some(top) => new_folder.join(top),
+        None => new_folder.clone(),
+    };
+    let paused = h.is_paused() || h.stats().finished;
+    let only_files = h.only_files();
+    let trackers: Vec<String> = h.shared().trackers.iter().map(|u| u.to_string()).collect();
+    let re_add = |folder: PathBuf| {
+        let o = AddTorrentOptions {
+            paused,
+            overwrite: true,
+            output_folder: Some(folder.to_string_lossy().into_owned()),
+            only_files: only_files.clone(),
+            trackers: (!trackers.is_empty()).then(|| trackers.clone()),
+            ..Default::default()
+        };
+        let b = bytes.clone();
+        async move { st.session.add_torrent(AddTorrent::from_bytes(b), Some(o)).await }
+    };
+    std::fs::create_dir_all(tidebox).map_err(|e| format!("create {}: {e}", tidebox.display()))?;
+    if single {
+        std::fs::create_dir(&new_folder).map_err(|e| format!("create {}: {e}", new_folder.display()))?;
+    }
+
+    st.session
+        .delete(TorrentIdOrHash::Hash(h.info_hash()), false)
+        .await
+        .map_err(|e| format!("forget failed: {e:#}"))?;
+    if let Err(e) = move_path(&src, &dst) {
+        if single {
+            let _ = std::fs::remove_dir(&new_folder);
+        }
+        let back = re_add(old_folder.clone()).await;
+        return Err(format!("moving {} failed: {e}; re-added in place: {}", src.display(), back.is_ok()));
+    }
+    let mut moved_sidecars = vec![];
+    for (s, name) in &sidecars {
+        let to = new_folder.join(name);
+        match move_path(s, &to) {
+            Ok(()) => moved_sidecars.push((s.clone(), to)),
+            Err(e) => tracing::warn!(%key, "moving sidecar {} failed: {e}", s.display()),
+        }
+    }
+    match re_add(new_folder.clone()).await {
+        Ok(_) => Ok(Some(new_folder)),
+        Err(e) => {
+            // Put everything back and re-add at the old place.
+            let _ = move_path(&dst, &src);
+            for (s, to) in &moved_sidecars {
+                let _ = move_path(to, s);
+            }
+            if single {
+                let _ = std::fs::remove_dir(&new_folder);
+            }
+            let back = re_add(old_folder).await;
+            Err(format!("re-add failed: {e:#}; restored in place: {}", back.is_ok()))
+        }
+    }
 }
 
 // ---------------------------------------------------------------- commands
@@ -1092,5 +1336,121 @@ mod restart_tests {
         while !h.is_finished() {
             std::thread::sleep(Duration::from_millis(200));
         }
+    }
+}
+
+#[cfg(test)]
+mod migrate_tests {
+    use super::*;
+
+    #[test]
+    fn clean_names() {
+        let c = clean_folder_name;
+        assert_eq!(c("www.UIndex.org    -    The.Diplomat.US.S04E06.MULTI.1080p.WEB.X264-HiggsBoson"), "The.Diplomat.US.S04E06.MULTI.1080p.WEB.X264-HiggsBoson");
+        assert_eq!(c("The.Diplomat.US.S04E07.1080p.WEB.h264-ETHEL[EZTVx.to]"), "The.Diplomat.US.S04E07.1080p.WEB.h264-ETHEL");
+        assert_eq!(c("[ www.Torrenting.com ] - Some  Show  S01 "), "Some Show S01");
+        assert_eq!(c("【高清影视之家发布 www.HDBTHD.com】Film.2020"), "Film.2020");
+        assert_eq!(c("Show S01E01 [eztv]"), "Show S01E01");
+        assert_eq!(c("  Tëst  Ğüşİöç: Part/2  "), "Tëst Ğüşİöç- Part-2");
+        assert_eq!(c("..hidden"), "hidden");
+        assert_eq!(c("Name (2)"), "Name (2)");
+        assert_eq!(c("Big Buck Bunny (2008) [1080p]"), "Big Buck Bunny (2008) [1080p]");
+        assert_eq!(c("Animals.2026.1080p.WEB-DL"), "Animals.2026.1080p.WEB-DL");
+        assert_eq!(c("[www.site.org]"), "Download");
+        let long = "ş".repeat(300);
+        assert!(c(&long).len() <= 200);
+        for s in ["www.UIndex.org    -    X [EZTVx.to]", "  a  b  ", "Tëst [EZTVx.to]"] {
+            assert_eq!(c(&c(s)), c(s), "idempotent");
+        }
+    }
+
+    /// Isolated end-to-end check (not run by default). HOME must be a scratch dir.
+    /// TIDE_MIG_PHASE=setup adds TIDE_MIG_TORRENTS ("file.torrent::folder under
+    /// ~/Downloads::live|paused", ';' separated); =migrate runs the startup migration and
+    /// checks the layout; =remove also removes everything with files.
+    #[test]
+    #[ignore]
+    fn migrate_isolated() {
+        assert_eq!(std::env::var("TIDE_LIVE_TEST").as_deref(), Ok("1"));
+        let home = std::env::var("HOME").unwrap();
+        assert!(home.contains("scratchpad"), "HOME must be isolated");
+        let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::new("info")).try_init();
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let st = std::sync::Arc::new(rt.block_on(crate::state::init()).unwrap());
+        let dl = Path::new(&home).join("Downloads");
+        let phase = std::env::var("TIDE_MIG_PHASE").unwrap();
+        rt.block_on(async {
+            if phase == "setup" {
+                for t in std::env::var("TIDE_MIG_TORRENTS").unwrap().split(';') {
+                    let mut it = t.split("::");
+                    let (t, folder, mode) = (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
+                    let bytes = std::fs::read(t).unwrap();
+                    let r = st
+                        .session
+                        .add_torrent(
+                            AddTorrent::from_bytes(bytes),
+                            Some(AddTorrentOptions {
+                                overwrite: true,
+                                paused: mode == "paused",
+                                output_folder: Some(dl.join(folder).to_string_lossy().into_owned()),
+                                ..Default::default()
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                    let h = r.into_handle().unwrap();
+                    wait_initialized(&h).await.unwrap();
+                    let s = h.stats();
+                    eprintln!("added {} at {:?} finished={} have={}", h.info_hash().as_string(), h.output_folder(), s.finished, s.progress_bytes);
+                }
+                return;
+            }
+            let before: HashMap<String, u64> = list_rows(&st)
+                .into_iter()
+                .map(|r| (r.key.clone(), handle(&st, &r.key).unwrap().stats().progress_bytes))
+                .collect();
+            migrate_to_tidebox(&st).await;
+            let tb = st.download_dir.clone();
+            for r in list_rows(&st) {
+                let h = handle(&st, &r.key).unwrap();
+                wait_initialized(&h).await.unwrap();
+                let out = PathBuf::from(r.output_path.clone().unwrap());
+                let s = h.stats();
+                eprintln!("row {} {:?} paused={} finished={} have={} folder={:?} out={:?}", &r.key[..8], r.state, h.is_paused(), s.finished, s.progress_bytes, h.output_folder(), out);
+                assert_eq!(h.output_folder().parent(), Some(tb.as_path()));
+                assert!(out.exists(), "{out:?}");
+                assert_eq!(s.progress_bytes, before[&r.key], "progress kept");
+                assert_eq!(h.is_paused(), s.finished, "finished ones paused, live one live");
+                for f in files(&st, &r.key).unwrap() {
+                    let p = file_abs_path(&st, &r.key, f.index).unwrap();
+                    assert!(p.starts_with(h.output_folder()));
+                    let url = format!("asset://localhost/{}", urlencoding::encode(&p.to_string_lossy()));
+                    let back = urlencoding::decode(url.strip_prefix("asset://localhost/").unwrap()).unwrap();
+                    assert_eq!(Path::new(back.as_ref()), p);
+                }
+                let (side, folder) = crate::metadata::sidecar_paths(&st, &r.key);
+                eprintln!("  sidecars {:?} folder={:?}", side.iter().map(|p| p.file_name().unwrap().to_owned()).collect::<Vec<_>>(), folder);
+                assert!(side.iter().all(|s| s.parent() == Some(h.output_folder())));
+                assert_eq!(folder.as_deref(), Some(h.output_folder()), "folder-style sidecars");
+                let art = crate::artwork::pick_artwork(&st, &r.key).await.unwrap();
+                eprintln!("  artwork found={}", art.poster.is_some());
+            }
+            let left: Vec<_> = std::fs::read_dir(&dl).unwrap().flatten().map(|e| e.file_name()).filter(|n| n != "Tidebox" && n != ".DS_Store").collect();
+            assert!(left.is_empty(), "left behind in Downloads: {left:?}");
+            let mut tops: Vec<_> = std::fs::read_dir(&tb).unwrap().flatten().map(|e| (e.file_name(), e.path().is_dir())).collect();
+            tops.sort();
+            eprintln!("Tidebox: {tops:#?}");
+            // The only loose file allowed is the foreign one the setup planted.
+            assert!(tops.iter().filter(|(_, d)| !*d).count() <= 1, "no loose torrent files in Tidebox");
+            if phase == "remove" {
+                for r in list_rows(&st) {
+                    let out = PathBuf::from(r.output_path.clone().unwrap());
+                    remove(&st, &r.key, true).await.unwrap();
+                    assert!(!out.exists(), "{out:?}");
+                }
+                let left: Vec<_> = std::fs::read_dir(&tb).unwrap().flatten().map(|e| e.file_name()).collect();
+                eprintln!("Tidebox after remove: {left:?}");
+            }
+        });
     }
 }

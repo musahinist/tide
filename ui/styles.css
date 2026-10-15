@@ -36,11 +36,11 @@ button { font: inherit; color: inherit; }
 /* ---------- top strip ---------- */
 #top {
   flex: none;
-  height: 40px;
+  height: 52px;
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 0 10px 0 80px;
+  padding: 0 12px 0 88px;
 }
 
 #add {
@@ -108,7 +108,7 @@ body.adding #plus { transform: rotate(45deg); }
 
 #empty {
   position: fixed;
-  inset: 40px 0 0;
+  inset: 52px 0 0;
   margin: 0;
   display: grid;
   place-items: center;

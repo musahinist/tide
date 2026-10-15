@@ -94,6 +94,7 @@ fn main() -> anyhow::Result<()> {
     tauri::async_runtime::set(rt.handle().clone());
 
     let st = Arc::new(rt.block_on(state::init())?);
+    rt.block_on(engine::migrate_to_tidebox(&st));
     rt.block_on(engine::restore_pending(&st));
     println!("tide: stream server on http://127.0.0.1:{}/", st.stream_port);
     tracing::info!(port = st.stream_port, "stream server listening");

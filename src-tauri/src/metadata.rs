@@ -745,7 +745,30 @@ pub struct Loc {
 
 impl Loc {
     pub fn from_parts(output_path: &Path, files: Vec<FileRow>, name: &str, paused: bool) -> Loc {
-        let single = files.len() == 1;
+        Self::from_parts_in(output_path, files, name, paused, None)
+    }
+
+    /// `shared`: the download dir. A single file in its own folder (not directly in
+    /// `shared` or its parent) uses folder-style sidecars (`tide.json`, `poster.jpg`…),
+    /// unless old `<stem>.tide.json` sidecars are still next to it.
+    pub fn from_parts_in(output_path: &Path, files: Vec<FileRow>, name: &str, paused: bool, shared: Option<&Path>) -> Loc {
+        let mut single = files.len() == 1;
+        if single {
+            if let (Some(shared), Some(dir), Some(stem)) = (shared, output_path.parent(), output_path.file_stem()) {
+                let own = dir != shared && Some(dir) != shared.parent();
+                let legacy = dir.join(format!("{}.tide.json", stem.to_string_lossy())).is_file();
+                if own && !legacy {
+                    single = false;
+                }
+            }
+        }
+        let output_path = if single || files.len() != 1 {
+            output_path.to_path_buf()
+        } else {
+            // Folder-style single: the folder holds the file under its relative name.
+            output_path.parent().map(Path::to_path_buf).unwrap_or_default()
+        };
+        let output_path = output_path.as_path();
         let (dir, stem, exists) = if single {
             (
                 output_path.parent().map(Path::to_path_buf).unwrap_or_default(),
@@ -815,7 +838,7 @@ fn locate(st: &AppState, key: &str) -> Result<Loc, String> {
         .ok_or_else(|| format!("NOT_FOUND: no torrent {key}"))?;
     let out = row.output_path.clone().ok_or_else(|| not_ready("metadata not resolved yet"))?;
     let files = engine::files(st, key)?;
-    Ok(Loc::from_parts(Path::new(&out), files, &row.name, row.state == TorrentState::Paused))
+    Ok(Loc::from_parts_in(Path::new(&out), files, &row.name, row.state == TorrentState::Paused, Some(&st.download_dir)))
 }
 
 // ---------------------------------------------------------------- sidecars
