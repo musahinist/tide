@@ -424,6 +424,43 @@ pub async fn read_file(
         .map_err(|_| not_ready(format!("timed out after {timeout_s}s reading file #{idx}")))?
 }
 
+/// Well-known public trackers appended to every magnet we add. Many magnets carry
+/// few or no trackers; these make metadata/peer discovery much faster than DHT
+/// alone. (Magnets can't be private-flagged, so this never leaks a private torrent.)
+const EXTRA_TRACKERS: &[&str] = &[
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://exodus.desync.com:6969/announce",
+    "udp://open.demonii.com:1337/announce",
+    "udp://tracker.openbittorrent.com:6969/announce",
+    "udp://explodie.org:6969/announce",
+    "udp://tracker.dler.org:6969/announce",
+    "udp://open.tracker.cl:1337/announce",
+    "udp://tracker.qu.ax:6969/announce",
+];
+
+/// Return `magnet` (a `magnet:` URI or bare 40-hex info hash) as a `magnet:` URI
+/// with `EXTRA_TRACKERS` appended as `tr=` params, skipping ones already present.
+/// librqbit 9.0.1 ignores `AddTorrentOptions::trackers` for magnets (it only reads
+/// the magnet's own `tr=`), hence the string append.
+fn with_extra_trackers(magnet: &str, existing: &[String]) -> String {
+    let norm = |t: &str| t.trim().trim_end_matches('/').to_ascii_lowercase();
+    let have: std::collections::HashSet<String> = existing.iter().map(|t| norm(t)).collect();
+    let mut out = if magnet.starts_with("magnet:") {
+        magnet.to_string()
+    } else {
+        format!("magnet:?xt=urn:btih:{magnet}")
+    };
+    for tr in EXTRA_TRACKERS {
+        if !have.contains(&norm(tr)) {
+            out.push_str("&tr=");
+            out.push_str(tr); // scheme/host/path chars are all query-safe
+        }
+    }
+    out
+}
+
 /// Shared by the `add_magnet` command and the magnet: deep-link handler.
 /// Returns immediately; metadata is resolved by a background task tracked in
 /// `AppState.pending`.
@@ -474,6 +511,7 @@ pub async fn add_magnet_internal(st: &AppState, magnet: &str) -> Result<AddMagne
     let session = st.session.clone();
     let task_key = key.clone();
     let stored_magnet = magnet.clone();
+    let magnet = with_extra_trackers(&magnet, &parsed.trackers);
     let task = tokio::spawn(async move {
         let opts = AddTorrentOptions {
             overwrite: true,
@@ -664,6 +702,83 @@ mod tests {
         assert!(parse_key("08ada5a7a6183aae1e09d831df6748d566095a10").is_ok());
         assert!(parse_key("08ADA5A7A6183AAE1E09D831DF6748D566095A10").is_ok());
         assert!(parse_key("nope").unwrap_err().starts_with("INVALID_INPUT"));
+    }
+
+    #[test]
+    fn extra_trackers() {
+        let ih = "08ada5a7a6183aae1e09d831df6748d566095a10";
+        let m = format!("magnet:?xt=urn:btih:{ih}&dn=Sintel&tr=udp%3A%2F%2Fexplodie.org%3A6969");
+        let parsed = Magnet::parse(&m).unwrap();
+        let out = with_extra_trackers(&m, &parsed.trackers);
+        let p2 = Magnet::parse(&out).unwrap();
+        assert_eq!(p2.as_id20().unwrap().as_string(), ih);
+        assert_eq!(p2.name.as_deref(), Some("Sintel"));
+        // explodie.org already present (without /announce -> different URL, kept).
+        assert_eq!(p2.trackers.len(), 1 + EXTRA_TRACKERS.len());
+        assert!(p2.trackers.iter().all(|t| t.starts_with("udp://")));
+
+        // Exact duplicate is skipped.
+        let m = format!("magnet:?xt=urn:btih:{ih}&tr=udp://tracker.opentrackr.org:1337/announce");
+        let parsed = Magnet::parse(&m).unwrap();
+        let out = with_extra_trackers(&m, &parsed.trackers);
+        assert_eq!(Magnet::parse(&out).unwrap().trackers.len(), EXTRA_TRACKERS.len());
+
+        // Bare info hash becomes a magnet URI.
+        let out = with_extra_trackers(ih, &[]);
+        let p3 = Magnet::parse(&out).unwrap();
+        assert_eq!(p3.as_id20().unwrap().as_string(), ih);
+        assert_eq!(p3.trackers.len(), EXTRA_TRACKERS.len());
+    }
+
+    /// Live network check (not run by default): adds the tracker-less Sintel magnet
+    /// and waits until it resolves, has peers and downloads some bytes. `state::init`
+    /// uses `$HOME`, so run the prebuilt test binary with an isolated HOME and
+    /// `TIDE_LIVE_TEST=1`, e.g.
+    /// `HOME=/tmp/x TIDE_LIVE_TEST=1 target/debug/deps/tide-<hash> --ignored live_sintel --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_sintel() {
+        assert_eq!(
+            std::env::var("TIDE_LIVE_TEST").as_deref(),
+            Ok("1"),
+            "set TIDE_LIVE_TEST=1 and an isolated HOME"
+        );
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(
+                "info,librqbit_upnp=debug,librqbit_tracker_comms=debug",
+            ))
+            .try_init();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let st = crate::state::init().await.unwrap();
+            let r = add_magnet_internal(
+                &st,
+                "magnet:?xt=urn:btih:08ada5a7a6183aae1e09d831df6748d566095a10&dn=Sintel",
+            )
+            .await
+            .unwrap();
+            let t0 = std::time::Instant::now();
+            let mut resolved_at = None;
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let rows = list_rows(&st);
+                let row = rows.iter().find(|x| x.key == r.key).unwrap();
+                eprintln!(
+                    "t={:>3}s state={:?} peers={} down={:.0}B/s progress={}/{}",
+                    t0.elapsed().as_secs(), row.state, row.peers, row.down_bps,
+                    row.progress_bytes, row.total_bytes
+                );
+                if resolved_at.is_none() && row.id.is_some() {
+                    resolved_at = Some(t0.elapsed());
+                    eprintln!("metadata resolved after {:?}", t0.elapsed());
+                }
+                // Hold ~20s so the background UPnP forwarder gets to report too.
+                if row.peers > 0 && row.progress_bytes > 5_000_000 && t0.elapsed().as_secs() >= 20 {
+                    break;
+                }
+                assert!(t0.elapsed() < Duration::from_secs(240), "no progress in 240s");
+            }
+        });
     }
 }
 

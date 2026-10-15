@@ -484,3 +484,160 @@ The target dir is shared: lock waits are normal, and never run `cargo clean`.
 - **Large data URLs** (a w1280 backdrop is about 150–400 KB, about 30% more as base64). Keep the LRU small (about 16). The UI keeps one per visible row. That's fine for typical list sizes.
 - **Offline/no key** is completely silent. Rows look exactly as today.
 - **v2 (YouTube)** has no interaction. MediaInfo is keyed by torrent key only.
+
+## Addendum (2026-10-15): matching messy torrent names — REQUIRED
+
+Torrent names are messy, e.g. `The.Matrix.1999.REMASTERED.1080p.BluRay.x264.DTS-HD.MA.5.1-FGT`, `[YTS.MX] Inception (2010) [1080p]`, `Breaking.Bad.S03E07.720p.HDTV.x264-CTU`, `Yüzüklerin.Efendisi.Kralın.Dönüşü.2003.TR.Dublaj`. Matching is a multi-stage pipeline. Prefer no match over a wrong match.
+
+1. **IMDb id first, which gives an exact match.**
+   - Scan the torrent's small text files: `.nfo` and `.txt` files of 256 KB or less.
+   - Read them via `engine::read_file`, so they are priority-fetched.
+   - Look for the pattern `tt\d{7,8}`, which also appears inside imdb.com URLs.
+   - If an id is found, call TMDB `/3/find/{imdb_id}?external_source=imdb_id`. The result is a certain match.
+2. **Clean the name.**
+   - Strip bracketed groups. This removes `[YTS.MX]`, but a year in parentheses must still be read before it goes, e.g. `(2010)`.
+   - Strip a trailing `-GROUP`.
+   - Strip quality, source, codec, audio and edition tokens: 2160p/1080p/720p/480p, 4K, UHD, HDR, DV, BluRay, BRRip, BDRip, WEB-DL, WEBRip, WEB, HDTV, DVDRip, x264/x265/H.264/HEVC/AV1/XviD, AAC/AC3/DTS(-HD)/TrueHD/Atmos/DDP5.1/5.1/7.1, REMASTERED/EXTENDED/UNRATED/DIRECTORS.CUT/PROPER/REPACK/LIMITED/IMAX, MULTi, DUAL, TR, Dublaj, Altyazı, Türkçe, NF/AMZN/DSNP/HMAX.
+   - Replace `.` and `_` with spaces.
+   - Extract the year (1900 to the current year + 1) and S/E markers (`S03E07`, `3x07`, `Season 3`, `Sezon 3`, `Complete`). The title is everything before the first marker.
+3. **Candidate names to try, in order:** the torrent name, then the largest video file's basename, then its parent folder name. Clean each one with step 2.
+4. **Search ladder, using language tr-TR:**
+   1. title + year
+   2. title without the year
+   3. title with its last word dropped (only if the title has 3 or more words)
+   - Search `tv` first if S/E markers are present, otherwise `movie` first. Try the other type as a fallback.
+5. **Confidence check before auto-accepting.**
+   - Normalise both names: lowercase, strip diacritics, drop punctuation and leading "the/a".
+   - Take the best similarity among the result's title, original_title and alternative titles. Use token-set ratio or Jaro-Winkler; the `strsim` crate is fine.
+   - Auto-accept only if similarity ≥ 0.85 and the year matches (±1), or similarity ≥ 0.95 when no year is known.
+   - Otherwise do NOT write sidecars. Record a "needs_match" state and show a small "Eşleştir" (Match) action on the row. It opens the manual search, pre-filled with the cleaned title.
+6. **Tests.** A table of at least 25 real-world messy names with expected (title, year, S, E), including the Turkish examples above. Also unit tests for the confidence function.
+
+### Edge cases the parser and matcher MUST handle (user: "handle all cases")
+
+Each item below needs a test case.
+
+**Skip lookup entirely**
+- Do not look up torrents that are not video: there is no video file, or the video files are under 50 MB total (music, software, ISOs, ebooks).
+- Do not look up sample files.
+
+**Site prefixes and suffixes**
+- Strip prefixes like `www.Torrenting.com - Title`, `[ www.site.org ]`, `【site】`.
+- Strip trailing `[eztv]`, `[rarbg]`, `(Hi10)`.
+
+**Years**
+- Some titles contain or are a year: `2001 A Space Odyssey 1968`, `Blade Runner 2049 (2017)`, `1917.2019.1080p`.
+- Treat the LAST plausible year as the release year. If the title would otherwise become empty, the number belongs to the title.
+
+**Numbers that belong to the title**
+- `Ocean's Eleven`, `Se7en`, `21 Jump Street`, `9-1-1.S05E03`, `Fantastic.4`.
+- `Rocky II`: keep Roman numerals.
+- Also titles with an apostrophe or ampersand, e.g. `Law & Order`.
+
+**TV naming variants**
+- `S01E01E02` and `S01E01-E03` (multi-episode).
+- `1x05`, `105` (only if it follows the title and there is no year).
+- `Season 1 Episode 5`, `Sezon 1 Bölüm 5`, `Ep05`, `E05`, `Part 2`.
+- Season packs: `S01-S05`, `S01.COMPLETE`, `Complete Series`, `Seasons 1-3`.
+
+**Daily shows**
+- `The.Daily.Show.2024.10.15`: an air date.
+- Use TMDB's TV search, then the episode by air date if feasible; otherwise show-level only.
+
+**Anime**
+- `[SubsPlease] Frieren - 05 (1080p) [ABCD1234].mkv`, `[Erai-raws] Title - 12v2`.
+- These use absolute episode numbers, a group name in the leading bracket and a CRC in the trailing bracket.
+- Treat them as TV and search `tv` first.
+
+**Country, region and disambiguation**
+- `Doctor Who (2005)`, `The Office US`, `House of Cards (US)`.
+- Use the year or country as a disambiguation hint and do not strip it blindly.
+
+**Alternate titles**
+- `Amelie.AKA.Le.Fabuleux.Destin...`: try both sides of AKA.
+- Turkish and other local titles: search tr-TR first, then en-US, and compare against `original_title` and the alternative titles.
+
+**Collections and box sets**
+- Examples: `The Lord of the Rings Trilogy`, `Harry Potter 1-8 Collection`.
+- Do not force a single movie. Match per video file instead (each large video file gets its own parse), or mark the torrent as a collection with no single match.
+
+**Multi-file torrents with mixed content**
+- When a torrent holds several videos (episodes), the torrent-level info is the show and the files carry episode info.
+- Each file's episode is parsed from its own name.
+
+**Unicode, case and punctuation**
+- Handle full-width brackets, diacritics, non-Latin scripts (CJK, Cyrillic) and mixed case.
+
+**Extra and junk files**
+- Ignore `Sample`, `Extras`, `Featurettes` and `Trailer` files when picking the main video.
+
+**Duplicates and remakes**
+- `The Lion King 1994` and `The Lion King 2019`: the year decides.
+- Without a year, do not auto-accept when more than one strong candidate exists. Mark it `needs_match`.
+
+**Output**
+- The parser returns a struct with a `confidence` breakdown, so the UI and tests can explain why something was or wasn't auto-matched.
+
+### UI decision (user, 2026-10-15): artwork priority + expanded detail view
+
+**Artwork priority for the row thumbnail and background:**
+1. TMDB data (sidecar `poster.jpg` / `fanart.jpg` written by us).
+2. A poster image found inside the torrent or folder (`artwork.rs` / `get_artwork`, already implemented separately).
+3. None.
+
+The local-poster feature stays as the fallback, so it works without a TMDB key.
+
+**Expanded detail view** (opened by clicking the row; replaces the current plain file list). This is a two-part panel that stays minimal:
+
+**A. Media details.** Shown only when MediaInfo exists:
+- Poster on the left, about 120px wide.
+- Title (Year), plus "S02E05 · Episode title" for TV.
+- ★ rating, genres, runtime.
+- Overview, clamped to 4 lines, with "more".
+- An "IMDb ↗" link.
+- A muted "Wrong match?" link that opens the manual search.
+- If the row is `needs_match`, a single "Eşleştir" button with the search pre-filled.
+- If there is no info and no key, this part is hidden entirely and part B starts at the top.
+
+**B. Torrent details:**
+- **Stats row:** size, downloaded/total, ↓/↑ speed, peers, ratio, ETA, save path (click → Show in Finder).
+- **File list,** as today: name, size, %, and ▶ for media; subtitle files shown with a small "CC" tag. Each episode file shows its own parsed SxxEyy if known.
+- **Collapsible "More" section:** info hash (with a copy button), magnet link (with a copy button), and the number of trackers.
+
+**Panel behaviour:**
+- Opens with a smooth height animation.
+- Only one row is expanded at a time.
+- Esc closes it.
+- It must survive the 1 Hz updates; diff the panel just like the rows.
+
+### IMDb rating (user, 2026-10-15): show the IMDb rating as well as the TMDB rating
+
+TMDB does not provide the IMDb rating; it only gives TMDB's own `vote_average`. Get it from IMDb's official non-commercial dataset. This needs no API key.
+
+**Source:** `https://datasets.imdbws.com/title.ratings.tsv.gz`
+- About 8.7 MB gzip, updated daily.
+- TSV columns: `tconst	averageRating	numVotes`.
+- Licensed for personal, non-commercial use, which is our case.
+
+**Refresh:**
+- Download lazily the first time a rating is needed for an `imdb_id` that has no stored rating.
+- Store it in `data_dir/imdb/title.ratings.tsv.gz`.
+- Re-download at most once every 7 days, using If-Modified-Since.
+
+**Lookup:**
+- Stream-decompress with `flate2`, which is likely already in the tree; check `cargo tree`.
+- Build an in-memory `HashMap<u32 (tt numeric), (f32 rating, u32 votes)>` only while needed, or binary-search a compact sorted Vec. It holds about 1.5M rows, under 20 MB RAM.
+- Drop the map after use if it isn't needed again within a few minutes.
+
+**Write-once:**
+- Store `imdb_rating` and `imdb_votes` in `tide.json` (and `<ratings>` in the `.nfo` with `name="imdb"`) when the media info is first written.
+- Opening the app never re-queries.
+- Rows whose sidecar lacks `imdb_rating` (e.g. an id was found later) are filled in the next time the dataset is present.
+
+**Optional fallback:** an OMDb key field in settings (free, 1000/day). Only implement it if trivial; the dataset is the primary source.
+
+**UI:**
+- In the detail panel, show both ratings: "IMDb 8.7 (2.1M) · TMDB 8.2". The IMDb part has the yellow IMDb style: a small "IMDb" badge.
+- The row stats line shows the IMDb rating if present, otherwise TMDB.
+
+**MediaInfo additions:** `imdb_rating: f32|null`, `imdb_votes: u32|null`.

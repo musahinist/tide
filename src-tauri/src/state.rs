@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use librqbit::http_api::{HttpApi, HttpApiOptions};
-use librqbit::{Api, Session, SessionOptions, SessionPersistenceConfig};
+use librqbit::{
+    Api, ListenerMode, ListenerOptions, Session, SessionOptions, SessionPersistenceConfig,
+};
 use tracing::debug_span;
 
 #[allow(dead_code)]
@@ -46,6 +48,25 @@ fn bind_stream_listener() -> anyhow::Result<librqbit_dualstack_sockets::TcpListe
     Err(anyhow::anyhow!("could not bind stream listener: {last_err:?}"))
 }
 
+/// Preferred BitTorrent peer-listen ports (the classic 6881–6889 range).
+const PEER_PORTS: std::ops::RangeInclusive<u16> = 6881..=6889;
+
+/// Pick the first free TCP port in `PEER_PORTS` (dual-stack, all interfaces),
+/// falling back to 0 (OS-assigned) if the whole range is taken — e.g. another
+/// BitTorrent client is running. The probe socket is dropped right away; librqbit
+/// re-binds the port itself.
+fn pick_peer_port() -> u16 {
+    use librqbit_dualstack_sockets::TcpListener;
+    for port in PEER_PORTS {
+        let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
+        if TcpListener::bind_tcp(addr, Default::default()).is_ok() {
+            return port;
+        }
+    }
+    tracing::warn!("peer ports {PEER_PORTS:?} all busy; using an OS-assigned port");
+    0
+}
+
 /// Must be called inside the tokio runtime (binding needs a reactor).
 pub async fn init() -> anyhow::Result<AppState> {
     let home = std::env::var_os("HOME").context("HOME not set")?;
@@ -66,11 +87,28 @@ pub async fn init() -> anyhow::Result<AppState> {
                 folder: Some(session_dir),
             }),
             fastresume: true,
+            // Accept incoming peer connections on a stable port and ask the router
+            // to forward it via UPnP, so peers behind NAT can reach us too.
+            listen: Some(ListenerOptions {
+                mode: ListenerMode::TcpOnly,
+                listen_addr: (std::net::Ipv6Addr::UNSPECIFIED, pick_peer_port()).into(),
+                enable_upnp_port_forwarding: true,
+                ..Default::default()
+            }),
             ..Default::default()
         },
     )
     .await
     .context("init librqbit session")?;
+    // UPnP runs in the background: librqbit logs "starting UPnP port forwarder"
+    // here, then (target librqbit_upnp, debug level, enabled by default in main.rs)
+    // "successfully port forwarded" or a "failed to ..." warning.
+    tracing::info!(
+        listen = ?session.listen_addr(),
+        announce_port = ?session.announce_port(),
+        upnp = true,
+        "peer listener ready"
+    );
 
     // With feature "tracing-subscriber-utils", Api::new takes 3 args.
     let api = Api::new(session.clone(), None, None);
