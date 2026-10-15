@@ -666,10 +666,3 @@ TMDB does not provide the IMDb rating; it only gives TMDB's own `vote_average`. 
 - The row stats line shows the IMDb rating if present, otherwise TMDB.
 
 **MediaInfo additions:** `imdb_rating: f32|null`, `imdb_votes: u32|null`.
-
-## Known issue (to fix later)
-Posters and fanart for newer titles are missing. Example: Animals (2026), tt31049299.
-- **Cause:** images.metahub.space answers 307 and redirects to live.metahub.space, and our image download doesn't follow it.
-- **Fix:**
-  - Follow redirects for image downloads.
-  - When tide.json exists but its images are missing, re-download only the images. Don't re-query the metadata.

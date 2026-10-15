@@ -75,6 +75,9 @@ struct IndexFile {
     misses: HashMap<String, u64>,
     #[serde(default)]
     needs: HashMap<String, NeedsRec>,
+    /// Failed sidecar-image self-heals: key -> time (retried after MISS_TTL).
+    #[serde(default)]
+    img_fail: HashMap<String, u64>,
 }
 
 #[derive(Default)]
@@ -92,6 +95,8 @@ pub struct MetaState {
     http: OnceLock<reqwest::Client>,
     /// Background IMDb-dataset rating fill-ins (Cinemeta lacks ratings for new titles).
     ratings: Arc<RatingQueue>,
+    /// Keys whose missing poster/fanart were re-fetched this run (at most once each).
+    healed: Mutex<HashSet<String>>,
 }
 
 impl Default for MetaState {
@@ -102,8 +107,26 @@ impl Default for MetaState {
             images: Mutex::new(VecDeque::new()),
             http: OnceLock::new(),
             ratings: Arc::default(),
+            healed: Mutex::default(),
         }
     }
+}
+
+/// metahub answers new titles with 307 -> live.metahub.space: follow up to 5 hops,
+/// https only (plain http only to loopback, for the tests' mock server).
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|a| {
+        let u = a.url();
+        let ok_scheme = u.scheme() == "https"
+            || (u.scheme() == "http" && matches!(u.host_str(), Some("127.0.0.1" | "localhost")));
+        if a.previous().len() > 5 {
+            a.error("too many redirects")
+        } else if !ok_scheme {
+            a.error("redirect to non-https URL")
+        } else {
+            a.follow()
+        }
+    })
 }
 
 fn index_path(dd: &Path) -> PathBuf {
@@ -117,6 +140,7 @@ impl MetaState {
                 reqwest::Client::builder()
                     .connect_timeout(REQUEST_TIMEOUT)
                     .user_agent(USER_AGENT)
+                    .redirect(redirect_policy())
                     .build()
                     .expect("reqwest client")
             })
@@ -744,6 +768,7 @@ pub struct Loc {
 }
 
 impl Loc {
+    #[cfg(test)]
     pub fn from_parts(output_path: &Path, files: Vec<FileRow>, name: &str, paused: bool) -> Loc {
         Self::from_parts_in(output_path, files, name, paused, None)
     }
@@ -1139,6 +1164,60 @@ async fn apply_match(
     Ok(info)
 }
 
+/// Self-heal for a matched title whose poster/fanart sidecar is missing (image not yet
+/// published when the match ran, network hiccup...): re-download just the images from
+/// metahub by IMDb id. No Cinemeta query. At most once per run per key; a failure
+/// backs off for MISS_TTL (persisted in the index). Returns true if anything was written.
+pub async fn heal_images(meta: &MetaState, dd: &Path, cm: &Cinemeta, key: &str, loc: &Loc, info: &MediaInfo, now: u64) -> bool {
+    if info.needs_match || !valid_tt(&info.imdb_id) || !loc.exists {
+        return false;
+    }
+    let n = names(loc.stem.as_deref());
+    let missing = |rel: &str| !loc.is_owned(rel) && !loc.dir.join(rel).exists();
+    let (need_p, need_f) = (missing(&n.poster), missing(&n.fanart));
+    if !(need_p || need_f) || read_sidecar(loc).is_none() {
+        return false;
+    }
+    if meta.with(dd, |g| g.index.img_fail.get(key).is_some_and(|t| now.saturating_sub(*t) < MISS_TTL)) {
+        return false;
+    }
+    if !meta.healed.lock().unwrap().insert(key.to_string()) {
+        return false;
+    }
+    let id = &info.imdb_id;
+    let (mut ok, mut wrote) = (true, false);
+    for (need, rel, url, px, keep) in [
+        (need_p, &n.poster, format!("{}/poster/medium/{id}/img", cm.images), 750, 1_000_000),
+        (need_f, &n.fanart, format!("{}/background/medium/{id}/img", cm.images), 1280, 400_000),
+    ] {
+        if !need {
+            continue;
+        }
+        match fetch_image(cm, Some(url), px, keep).await {
+            Some(b) => {
+                put_sidecar(loc, rel, Some(&b));
+                wrote = true;
+            }
+            None => ok = false,
+        }
+    }
+    let had_fail = meta.with(dd, |g| g.index.img_fail.contains_key(key));
+    if !ok {
+        meta.with_index(dd, |ix| {
+            ix.img_fail.insert(key.to_string(), now);
+        });
+    } else if had_fail {
+        meta.with_index(dd, |ix| {
+            ix.img_fail.remove(key);
+        });
+    }
+    if wrote {
+        meta.drop_images(key);
+        tracing::info!("re-fetched missing sidecar images for {key}");
+    }
+    wrote
+}
+
 /// Steps 3..8 of the lookup order (after `locate`). `st` is only used to priority-fetch
 /// .nfo files that are not downloaded yet (None in tests).
 pub async fn lookup_loc(
@@ -1248,7 +1327,14 @@ pub async fn get_media_info(state: St<'_>, key: String) -> Result<Option<MediaIn
         return Ok(Some(i));
     }
     let loc = locate(&st, &key)?;
-    lookup_loc(&st.meta, &st.data_dir, &client(&st), Some(&st), &key, &loc, now_secs()).await
+    let r = lookup_loc(&st.meta, &st.data_dir, &client(&st), Some(&st), &key, &loc, now_secs()).await;
+    if let Ok(Some(info)) = &r {
+        let (st2, info, key2) = (st.clone(), info.clone(), key.clone());
+        tokio::spawn(async move {
+            heal_images(&st2.meta, &st2.data_dir, &client(&st2), &key2, &loc, &info, now_secs()).await;
+        });
+    }
+    r
 }
 
 /// Sidecar image as a data URL (small LRU).
@@ -1654,6 +1740,14 @@ mod tests {
                         .unwrap_or("")
                         .to_string();
                     hits.lock().unwrap().push(format!("{path} | {ua}"));
+                    // A body "REDIRECT:<url>" answers 307 to <url> ("{BASE}" expanded).
+                    let redirect = routes.iter().find(|(p, _)| *p == path).and_then(|(_, b)| b.strip_prefix(&b"REDIRECT:"[..]));
+                    if let Some(to) = redirect {
+                        let to = String::from_utf8_lossy(to).replace("{BASE}", &base);
+                        let head = format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        let _ = s.write_all(head.as_bytes()).await;
+                        return;
+                    }
                     let (status, body) = match routes.iter().find(|(p, _)| *p == path) {
                         // "{BASE}" in a body becomes this server's own URL.
                         Some((_, b)) => ("200 OK", match std::str::from_utf8(b) {
@@ -2002,5 +2096,56 @@ mod tests {
         (p2.season, p2.episode, p2.country) = (Some(1), Some(1), None);
         let o = auto_match(&cm, &[p2]).await.unwrap();
         assert!(matches!(o, Outcome::Needs { .. } | Outcome::NoMatch), "{o:?}");
+    }
+
+    #[tokio::test]
+    async fn heal_missing_images_follows_307() {
+        let dd = tmpdir("dd");
+        let dl = tmpdir("dl");
+        let folder = dl.join("Animals.2026.1080p.WEBRip.x265-GRP");
+        std::fs::create_dir_all(&folder).unwrap();
+        let m = mock_server(vec![
+            ("/poster/medium/tt31049299/img".to_string(), b"REDIRECT:{BASE}/live/poster".to_vec()),
+            ("/live/poster".to_string(), JPEG.to_vec()),
+            ("/background/medium/tt31049299/img".to_string(), b"REDIRECT:{BASE}/live/bg".to_vec()),
+            ("/live/bg".to_string(), JPEG.to_vec()),
+        ])
+        .await;
+        let cm = Cinemeta::new(&m.base, http());
+        // 307 -> 200 is followed.
+        assert_eq!(cm.image(&format!("{}/poster/medium/tt31049299/img", m.base)).await.unwrap(), JPEG);
+
+        let files = vec![
+            frow(0, "a.mkv", 2_000_000_000, FileKind::Video),
+            frow(1, "a.srt", 1_000, FileKind::Other),
+        ];
+        let loc = Loc::from_parts(&folder, files, "Animals.2026.1080p.WEBRip.x265-GRP", false);
+        let info = MediaInfo { imdb_id: "tt31049299".into(), title: "Animals".into(), year: Some(2026), ..Default::default() };
+        let ms = MetaState::default();
+        // No tide.json yet: nothing to heal.
+        assert!(!heal_images(&ms, &dd, &cm, "k", &loc, &info, 1000).await);
+        write_sidecars(&loc, "k", &info, None, None);
+        assert!(folder.join("tide.json").exists() && !folder.join("poster.jpg").exists());
+        let before = m.hits.lock().unwrap().len();
+        assert!(heal_images(&ms, &dd, &cm, "k", &loc, &info, 1000).await);
+        assert_eq!(std::fs::read(folder.join("poster.jpg")).unwrap(), JPEG);
+        assert_eq!(std::fs::read(folder.join("fanart.jpg")).unwrap(), JPEG);
+        // Images only: no Cinemeta meta request.
+        assert!(m.hits.lock().unwrap()[before..].iter().all(|h| !h.contains("/meta/")));
+        // At most once per run per key.
+        std::fs::remove_file(folder.join("poster.jpg")).unwrap();
+        assert!(!heal_images(&ms, &dd, &cm, "k", &loc, &info, 1000).await);
+
+        // Failure (404) -> 24 h backoff persisted in metadata.json, honoured by a new run.
+        let info2 = MediaInfo { imdb_id: "tt0000001".into(), ..info.clone() };
+        let ms2 = MetaState::default();
+        assert!(!heal_images(&ms2, &dd, &cm, "k2", &loc, &info2, 1000).await);
+        assert!(ms2.with(&dd, |g| g.index.img_fail.contains_key("k2")));
+        let ms3 = MetaState::default();
+        assert!(!heal_images(&ms3, &dd, &cm, "k2", &loc, &info2, 2000).await);
+        assert!(!ms3.healed.lock().unwrap().contains("k2"));
+        // After the backoff it retries.
+        assert!(!heal_images(&ms3, &dd, &cm, "k2", &loc, &info2, 1000 + MISS_TTL).await);
+        assert!(ms3.healed.lock().unwrap().contains("k2"));
     }
 }
