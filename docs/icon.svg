@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0.3" y2="1">
+      <stop offset="0" stop-color="#1b4580"/>
+      <stop offset="0.55" stop-color="#0f2547"/>
+      <stop offset="1" stop-color="#091629"/>
+    </linearGradient>
+    <linearGradient id="w1" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1f4f98"/>
+      <stop offset="1" stop-color="#11305f"/>
+    </linearGradient>
+    <linearGradient id="w2" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2f7ee6"/>
+      <stop offset="1" stop-color="#1b54ad"/>
+    </linearGradient>
+    <linearGradient id="w3" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6aaaf8"/>
+      <stop offset="1" stop-color="#3a86ea"/>
+    </linearGradient>
+    <linearGradient id="play" x1="0" y1="0" x2="0.6" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#cfe2fb"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.42" r="0.45">
+      <stop offset="0" stop-color="#5a9cff" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#5a9cff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.09"/>
+      <stop offset="0.45" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <clipPath id="sq"><rect x="100" y="100" width="824" height="824" rx="185" ry="185"/></clipPath>
+    <filter id="sh" x="-30%" y="-30%" width="160%" height="170%">
+      <feDropShadow dx="0" dy="12" stdDeviation="18" flood-color="#000814" flood-opacity="0.5"/>
+    </filter>
+    <filter id="ds" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#000000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+  <g filter="url(#ds)">
+    <rect x="100" y="100" width="824" height="824" rx="185" ry="185" fill="url(#bg)"/>
+  </g>
+  <g clip-path="url(#sq)">
+    <rect x="100" y="100" width="824" height="824" fill="url(#glow)"/>
+    <!-- play triangle (rounded), optically centred -->
+    <path filter="url(#sh)" fill="url(#play)" transform="translate(524 392) scale(0.86) translate(-548 -388)"
+      d="M408 262 C408 230 440 214 467 230 L682 356 C708 371 708 405 682 420 L467 546 C440 562 408 546 408 514 Z"/>
+    <!-- back wave -->
+    <path fill="url(#w1)" d="M60 640 C190 585 300 590 410 630 C530 674 650 676 770 625 C850 592 910 585 970 600 L970 980 L60 980 Z"/>
+    <!-- middle wave -->
+    <path fill="url(#w2)" d="M60 725 C180 672 300 676 420 720 C540 764 650 764 760 718 C845 683 910 676 970 688 L970 980 L60 980 Z"/>
+    <path fill="none" stroke="#8fc0ff" stroke-opacity="0.45" stroke-width="5" stroke-linecap="round"
+      d="M60 725 C180 672 300 676 420 720 C540 764 650 764 760 718 C845 683 910 676 970 688"/>
+    <!-- front wave -->
+    <path fill="url(#w3)" d="M60 818 C190 770 310 775 430 815 C545 853 655 852 765 812 C850 782 915 776 970 785 L970 980 L60 980 Z"/>
+    <path fill="none" stroke="#e3f0ff" stroke-opacity="0.7" stroke-width="5" stroke-linecap="round"
+      d="M60 818 C190 770 310 775 430 815 C545 853 655 852 765 812 C850 782 915 776 970 785"/>
+    <rect x="100" y="100" width="824" height="824" fill="url(#sheen)"/>
+  </g>
+  <rect x="101" y="101" width="822" height="822" rx="184" ry="184" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="2"/>
+</svg>
