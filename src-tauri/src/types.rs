@@ -182,6 +182,20 @@ pub struct Group {
     /// Set when the group was materialised from an automatic group key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_key: Option<String>,
+    /// Unix ms of the last change (Mac↔Mac sync, last writer wins; 0 = legacy).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub updated_at: u64,
+    /// Sync tombstone (never returned by `list_groups`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deleted: bool,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// Contents of `data_dir/groups.json`; also the return value of `list_groups`.
@@ -192,6 +206,9 @@ pub struct GroupsFile {
     /// Keys the user removed from a group: never auto-grouped again.
     #[serde(default)]
     pub excluded: std::collections::BTreeMap<String, bool>,
+    /// Unix ms of the last exclude/include per key (sync; absent = legacy).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub excluded_at: std::collections::BTreeMap<String, u64>,
 }
 
 // ---------------------------------------------------------------- yt-dlp (v2)

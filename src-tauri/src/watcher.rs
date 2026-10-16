@@ -81,6 +81,9 @@ struct WatcherFile {
     settings: WatcherSettings,
     seen: BTreeMap<String, String>,
     pending: Vec<NewEpisode>,
+    /// Device id (remote.rs) of the Mac where auto-add was last turned on: only that Mac
+    /// auto-adds (settings are synced between Macs). Empty = this Mac (legacy).
+    auto_add_device: String,
 }
 
 impl WatcherFile {
@@ -93,12 +96,8 @@ fn seen_key(imdb: &str, s: u32, e: u32) -> String {
     format!("{imdb}:{s}:{e}")
 }
 
-struct Store {
-    path: PathBuf,
-    file: WatcherFile,
-}
-
-static STORE: Mutex<Option<Store>> = Mutex::new(None);
+/// Loaded `watcher.json` files by data dir (tests use several).
+static STORE: Mutex<Option<HashMap<PathBuf, WatcherFile>>> = Mutex::new(None);
 /// Serialises checks (startup task vs. UI): a second caller sees the fresh `last_check`.
 static CHECK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -122,24 +121,62 @@ fn save(path: &Path, f: &WatcherFile) -> Result<(), String> {
 }
 
 fn with_file<R>(dd: &Path, f: impl FnOnce(&WatcherFile) -> R) -> R {
-    let mut g = STORE.lock().unwrap();
-    let s = g.get_or_insert_with(|| {
-        let path = dd.join("watcher.json");
-        Store { file: load(&path), path }
-    });
-    f(&s.file)
+    let mut g = STORE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = g.get_or_insert_with(HashMap::new);
+    let file = map.entry(dd.to_path_buf()).or_insert_with(|| load(&dd.join("watcher.json")));
+    f(file)
 }
 
 /// Mutate a copy, persist it, then swap it in.
 fn mutate<R>(dd: &Path, f: impl FnOnce(&mut WatcherFile) -> Result<R, String>) -> Result<R, String> {
     with_file(dd, |_| ());
-    let mut g = STORE.lock().unwrap();
-    let s = g.as_mut().expect("store loaded");
-    let mut next = s.file.clone();
+    let mut g = STORE.lock().unwrap_or_else(|e| e.into_inner());
+    let file = g.as_mut().and_then(|m| m.get_mut(dd)).ok_or_else(|| internal("watcher store not loaded"))?;
+    let mut next = file.clone();
     let out = f(&mut next)?;
-    save(&s.path, &next)?;
-    s.file = next;
+    save(&dd.join("watcher.json"), &next)?;
+    *file = next;
     Ok(out)
+}
+
+/// May this Mac auto-add? Only the Mac where auto-add was last turned on.
+fn auto_add_here(f: &WatcherFile, my_id: &str) -> bool {
+    f.settings.auto_add && (f.auto_add_device.is_empty() || f.auto_add_device == my_id)
+}
+
+// ---------------------------------------------------------------- sync (sync.rs)
+
+/// Synced part of `watcher.json`: settings (+ `auto_add_device`) and `unfollowed`.
+pub fn sync_get(dd: &Path) -> (Value, Vec<String>) {
+    with_file(dd, |f| {
+        let mut v = serde_json::to_value(&f.settings).unwrap_or(Value::Null);
+        if let Some(o) = v.as_object_mut() {
+            o.insert("auto_add_device".into(), Value::String(f.auto_add_device.clone()));
+        }
+        (v, f.unfollowed.clone())
+    })
+}
+
+/// Apply synced values (None = leave as is). A bad settings value is an error.
+pub fn sync_set(dd: &Path, settings: Option<&Value>, unfollowed: Option<Vec<String>>) -> Result<(), String> {
+    let parsed = match settings {
+        Some(v) => {
+            let s: WatcherSettings = serde_json::from_value(v.clone()).map_err(invalid)?;
+            let dev = v.get("auto_add_device").and_then(Value::as_str).unwrap_or("").to_string();
+            Some((s, dev))
+        }
+        None => None,
+    };
+    mutate(dd, |f| {
+        if let Some((s, dev)) = parsed {
+            f.settings = s;
+            f.auto_add_device = dev;
+        }
+        if let Some(u) = unfollowed {
+            f.unfollowed = u.into_iter().filter(|x| metadata::valid_tt(x)).collect();
+        }
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------- library
@@ -519,7 +556,7 @@ fn visible(file: &WatcherFile, followed: &[Followed]) -> Vec<NewEpisode> {
 }
 
 /// Returns (episodes to show, whether the network was used).
-async fn run_check(st: &AppState, force: bool) -> Result<(Vec<NewEpisode>, bool), String> {
+async fn run_check(st: &AppState, force: bool, my_id: &str) -> Result<(Vec<NewEpisode>, bool), String> {
     let _g = CHECK.lock().await;
     let dd = &st.data_dir;
     let file = with_file(dd, Clone::clone);
@@ -533,7 +570,7 @@ async fn run_check(st: &AppState, force: bool) -> Result<(Vec<NewEpisode>, bool)
     let found = check_followed(&followed, &cm, tz.as_ref(), &file.settings.quality, &iso(now)).await;
 
     let mut added = vec![];
-    if file.settings.auto_add {
+    if auto_add_here(&file, my_id) {
         for n in &found {
             let key = seen_key(&n.imdb_id, n.season, n.episode);
             if file.seen.contains_key(&key) || file.unfollowed.contains(&n.imdb_id) {
@@ -566,7 +603,8 @@ pub fn spawn_background(app: AppHandle, st: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(FIRST_DELAY).await;
         loop {
-            match run_check(&st, false).await {
+            let my_id = crate::sync::device_id();
+            match run_check(&st, false, &my_id).await {
                 Ok((list, true)) => {
                     if let Err(e) = app.emit("new-episodes", list) {
                         tracing::debug!("emit new-episodes failed: {e}");
@@ -610,16 +648,23 @@ pub async fn watcher_set_settings(
             tz.caps().await.map_err(|e| invalid(format!("Torznab check failed: {e}")))?;
         }
     }
-    mutate(&state.data_dir, |f| {
+    let my_id = crate::sync::device_id();
+    let out = mutate(&state.data_dir, |f| {
+        // Turned on here: this Mac becomes the one that auto-adds.
+        if next.auto_add && (!f.settings.auto_add || f.auto_add_device.is_empty()) {
+            f.auto_add_device = my_id;
+        }
         f.settings = next;
         Ok(f.info())
-    })
+    })?;
+    crate::sync::touch();
+    Ok(out)
 }
 
 #[tauri::command]
 pub async fn watcher_check(state: St<'_>, force: bool) -> Result<Vec<NewEpisode>, String> {
     let st: Arc<AppState> = state.inner().clone();
-    run_check(&st, force).await.map(|(v, _)| v)
+    run_check(&st, force, &crate::sync::device_id()).await.map(|(v, _)| v)
 }
 
 fn check_tt(imdb_id: &str) -> Result<(), String> {

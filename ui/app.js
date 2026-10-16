@@ -178,8 +178,18 @@ $('confirm').addEventListener('submit', (e) => {
 });
 
 // ---------- playback ----------
-const play = (key, fileIndex) =>
-  invoke('play_media', { media: { kind: 'torrent', key, fileIndex } }).catch(playError);
+// Unknown command (backend older than this UI) -> fall back quietly.
+const missingCmd = (e) => /^command \S+ not found|unknown command|NOT_IMPLEMENTED|not allowed/i.test(String(e && e.message ? e.message : e));
+function play(key, fileIndex) {
+  const ro = remoteOnly(key);
+  if (ro) {
+    return invoke('remote_play_local', { deviceId: ro.dev.id, key, fileIndex })
+      .catch((e) => (missingCmd(e) ? toast(`This Tide can’t play from ${ro.dev.name} yet`) : playError(e)));
+  }
+  return invoke('play_media', { media: { kind: 'torrent', key, fileIndex } }).catch(playError);
+}
+// Files of a torrent: local backend, or the other Mac's list from remote_library.
+const listFiles = (key) => { const ro = remoteOnly(key); return ro ? Promise.resolve(ro.files) : invoke('list_files', { key }); };
 function playError(e) {
   if (errCode(e) === 'NOT_READY') toast('Still checking files…'); else reportError(e);
 }
@@ -190,7 +200,7 @@ const pauseT = (key) => invoke('pause_torrent', { key }).then(refresh, reportErr
 // Index of the largest video/audio file, or null (after a toast).
 async function largestIdx(key) {
   try {
-    const media = (await invoke('list_files', { key })).filter((f) => f.kind === 'video' || f.kind === 'audio');
+    const media = (await listFiles(key)).filter((f) => f.kind === 'video' || f.kind === 'audio');
     if (!media.length) { toast('No video or audio in this torrent'); return null; }
     const f = media.reduce((a, b) => (b.size > a.size ? b : a));
     mainFile.set(key, f.index);
@@ -209,9 +219,13 @@ function remotePlay(dev, key, fileIndex) {
   invoke('remote_play', { deviceId: dev.id, media: { kind: 'torrent', key, fileIndex } })
     .then(() => toast(`Playing on ${dev.name}`), reportError);
 }
-// Screen button next to a ▶; `target` resolves to [key, fileIndex] (or null).
-function remoteBtn(target) {
+// Screen button next to a ▶; `target` resolves to [key, fileIndex] (or null). `keyOf`
+// (sync) names the torrent: one stored only on another Mac plays there, on its owner.
+function remoteBtn(target, keyOf) {
+  const owner = () => { const k = keyOf && keyOf(); const ro = k && remoteOnly(k); return ro ? ro.dev : null; };
   const b = iconBtn('screen', 'Play on another Mac', async () => {
+    const own = owner();
+    if (own) { closeMenu(); const t = await target(); if (t && t[1] != null) remotePlay(own, t[0], t[1]); return; }
     const devs = onlineDevices();
     if (!devs.length) return;
     const go = async (d) => { closeMenu(); const t = await target(); if (t && t[1] != null) remotePlay(d, t[0], t[1]); };
@@ -224,10 +238,45 @@ function remoteBtn(target) {
   });
   b.classList.add('rbtn');
   b.addEventListener('mouseenter', () => {
+    const own = owner();
+    if (own) { b.title = `Play on ${own.name}`; return; }
     const devs = onlineDevices();
     b.title = devs.length === 1 ? `Play on ${devs[0].name}` : 'Play on another Mac';
   });
   return b;
+}
+
+// ---------- other Macs' libraries (merged into the list and the library) ----------
+// remote_library: per paired Mac its rows + media info + files. Torrents only on another
+// Mac join the list as rows with `t.remote = { id, name, online }`; a local copy wins, so
+// items on both Macs show once. Refreshed on `sync-updated` and every 30 s.
+let localList = []; // last list from this Mac's backend
+let remoteRowsCache = []; // other Macs' rows (with .remote), rebuilt per remote_library
+const remoteByKey = new Map(); // key -> { dev, media, files }
+let localKeys = new Set();
+const remoteOnly = (key) => (localKeys.has(key) ? null : remoteByKey.get(key) || null);
+const shortDev = (name) => String(name || 'another Mac').replace(/^.*?['’]s\s+/, '');
+let remoteLibOk = true;
+function loadRemoteLib() {
+  if (!remoteLibOk) return Promise.resolve();
+  return invoke('remote_library').then((libs) => {
+    remoteByKey.clear();
+    remoteRowsCache = [];
+    for (const d of Array.isArray(libs) ? libs : []) {
+      const dev = { id: d.device_id, name: d.device_name || 'another Mac', online: !!d.online };
+      for (const t of d.rows || []) {
+        if (!t || !t.key || remoteByKey.has(t.key)) continue;
+        remoteByKey.set(t.key, { dev, media: (d.media || {})[t.key] || null, files: (d.files || {})[t.key] || [] });
+        remoteRowsCache.push({ ...t, remote: dev });
+      }
+    }
+    render(localList);
+  }, (e) => { if (missingCmd(e)) remoteLibOk = false; });
+}
+function mergeRemote(list) {
+  localKeys = new Set(list.map((t) => t.key));
+  const extra = remoteRowsCache.filter((t) => !localKeys.has(t.key));
+  return extra.length ? list.concat(extra) : list;
 }
 
 // ---------- rows (diffed by key) ----------
@@ -264,19 +313,22 @@ function createRow(key) {
   const stats = h('div', 'stats');
   const dot = h('span', 'dot');
   const statsText = h('span');
-  stats.append(dot, statsText);
+  const dev = h('span', 'devtag');
+  dev.hidden = true;
+  stats.append(dot, dev, statsText);
   const bar = h('div', 'bar');
   const fill = h('i');
   bar.append(fill);
 
-  const r = { el, head, name, statsText, fill, panel: null, details: null, last: null, artPri: 0 };
+  const r = { el, head, name, statsText, dev, fill, panel: null, details: null, last: null, artPri: 0 };
   const ctl = h('div', 'ctl');
   r.playBtn = iconBtn('play', 'Play', () => playLargest(key));
   r.pauseBtn = iconBtn('pause', 'Pause', () => pauseT(key));
   r.resumeBtn = iconBtn('resume', 'Resume', () => resumeT(key));
   r.revealBtn = iconBtn('folder', 'Show in Finder', () => invoke('reveal_torrent', { key }).catch(reportError));
   r.moreBtn = iconBtn('more', 'More', () => openMenu(r.moreBtn, { key }));
-  ctl.append(r.playBtn, remoteBtn(async () => { const i = await largestIdx(key); return [key, i]; }), r.pauseBtn, r.resumeBtn, r.revealBtn, iconBtn('remove', 'Remove', () => askRemove(r.last)), r.moreBtn);
+  r.removeBtn = iconBtn('remove', 'Remove', () => askRemove(r.last));
+  ctl.append(r.playBtn, remoteBtn(async () => { const i = await largestIdx(key); return [key, i]; }, () => key), r.pauseBtn, r.resumeBtn, r.revealBtn, r.removeBtn, r.moreBtn);
 
   r.art = h('div', 'art');
   r.check = h('button', 'wcheck', '✓');
@@ -288,6 +340,15 @@ function createRow(key) {
   return r;
 }
 
+// "on Mac mini" label for items stored on another Mac (rem = { name, online } or null).
+function setDevTag(el, rem) {
+  const txt = rem ? `on ${shortDev(rem.name)}` : '';
+  if (el.textContent !== txt) el.textContent = txt;
+  el.hidden = !rem;
+  el.title = rem ? `Stored on ${rem.name}${rem.online ? '' : ' (offline)'}` : '';
+  el.classList.toggle('off', !!rem && !rem.online);
+}
+
 function updateRow(r, t) {
   const p = r.last || {};
   const m = infoOf(t.key);
@@ -296,7 +357,9 @@ function updateRow(r, t) {
   if (r.watched !== w0) { r.watched = w0; r.check.classList.toggle('on', w0); r.check.title = w0 ? 'Watched — click to unmark' : 'Mark as watched'; }
   if (r.name.textContent !== title) r.name.textContent = title;
   if (p.name !== t.name) r.name.title = t.name;
-  const cls = `torrent s-${t.state}${t.key === openKey ? ' open' : ''}${r.group ? ' ep' : ''}${r.pack ? ' pack' : ''}`;
+  const rem = t.remote || null;
+  const cls = `torrent s-${t.state}${t.key === openKey ? ' open' : ''}${r.group ? ' ep' : ''}${r.pack ? ' pack' : ''}${rem ? ' remote' : ''}`;
+  setDevTag(r.dev, rem);
   if (r.el.className !== cls) r.el.className = cls;
   const rt = rating(m);
   const line = statsLine(t) + (rt ? ` · IMDb ${rt}` : '');
@@ -306,9 +369,10 @@ function updateRow(r, t) {
 
   const ready = t.state !== 'resolving' && t.id != null;
   r.playBtn.hidden = !ready || t.state === 'error' || t.state === 'initializing';
-  r.pauseBtn.hidden = !(t.state === 'downloading' || t.state === 'initializing');
-  r.resumeBtn.hidden = !(t.state === 'paused' || (t.state === 'error' && ready));
-  r.revealBtn.hidden = !t.output_path;
+  r.pauseBtn.hidden = !!rem || !(t.state === 'downloading' || t.state === 'initializing');
+  r.resumeBtn.hidden = !!rem || !(t.state === 'paused' || (t.state === 'error' && ready));
+  r.revealBtn.hidden = !!rem || !t.output_path;
+  r.removeBtn.hidden = !!rem;
   r.last = t;
   wantArtwork(t);
   wantMeta(t);
@@ -357,7 +421,7 @@ function wantEpisodes(t) {
   const live = t.state === 'downloading' || t.state === 'initializing';
   if (p.eps && p.state === t.state && !(live && p.eps.length > 1 && now - p.at > 2000)) return;
   p.busy = true;
-  invoke('list_episodes', { key: t.key }).then((eps) => {
+  episodesOf(t.key).then((eps) => {
     const before = p.eps ? p.eps.map((e) => e.file_index).join() : null;
     Object.assign(p, { eps: eps || [], state: t.state, at: Date.now(), tries: 0 });
     if (before !== p.eps.map((e) => e.file_index).join()) render(lastList);
@@ -365,6 +429,17 @@ function wantEpisodes(t) {
     p.tries++;
     p.next = Date.now() + (errCode(e) === 'NOT_FOUND' ? 60e3 : Math.min(60e3, 3e3 * 2 ** (p.tries - 1)));
   }).finally(() => { p.busy = false; });
+}
+// Episode files of a torrent; for one stored on another Mac, parsed from its file list.
+function episodesOf(key) {
+  const ro = remoteOnly(key);
+  if (!ro) return invoke('list_episodes', { key });
+  const vids = ro.files.filter((f) => f.kind === 'video' && !/(^|\/)sample/i.test(f.name));
+  if (!vids.length) return Promise.resolve([]);
+  return invoke('parse_names', { names: vids.map((f) => f.name.split('/').pop()) }).then((ps) => vids
+    .map((f, i) => ({ f, p: ps && ps[i] }))
+    .filter(({ p }) => p && p.is_tv && p.episode != null)
+    .map(({ f, p }) => ({ file_index: f.index, season: p.season, episode: p.episode, title_hint: p.title, norm: p.norm, size: f.size, progress: f.progress })));
 }
 const packOf = (key) => { const p = packs.get(key); return p && p.eps && p.eps.length > 1 ? p.eps : null; };
 
@@ -475,6 +550,8 @@ function carryOver(groups) {
 }
 
 function render(list) {
+  if (list !== lastList) localList = list || []; // render(lastList) = re-render, same local data
+  list = mergeRemote(localList);
   lastList = list;
   wantParse(list);
   for (const t of list) wantEpisodes(t);
@@ -544,7 +621,7 @@ function createGroup(gid) {
     const x = G.next;
     if (!x) return null;
     return [x.key, x.f ? x.f.file_index : await largestIdx(x.key)];
-  });
+  }, () => G.next && G.next.key);
   ctl.append(G.nextBtn, gRemote, more);
   G.head.append(G.art, G.name, stats, ctl, bar);
   G.head.addEventListener('click', () => {
@@ -558,9 +635,10 @@ function createGroup(gid) {
 
 // Episode-file row (one file of a season pack).
 function createFileRow(key, idx) {
-  const F = { el: h('section', 'torrent ep efile'), head: h('div', 'head'), name: h('div', 'name'), statsText: h('span'), fill: h('i') };
+  const F = { el: h('section', 'torrent ep efile'), head: h('div', 'head'), name: h('div', 'name'), statsText: h('span'), dev: h('span', 'devtag'), fill: h('i') };
+  F.dev.hidden = true;
   const stats = h('div', 'stats');
-  stats.append(h('span', 'dot'), F.statsText);
+  stats.append(h('span', 'dot'), F.dev, F.statsText);
   const bar = h('div', 'bar');
   bar.append(F.fill);
   F.check = h('button', 'wcheck', '✓');
@@ -568,7 +646,7 @@ function createFileRow(key, idx) {
   F.check.addEventListener('click', (e) => { e.stopPropagation(); toggleFileWatched(key, idx); });
   const ctl = h('div', 'ctl');
   F.playBtn = iconBtn('play', 'Play', () => play(key, idx));
-  ctl.append(F.playBtn, remoteBtn(() => [key, idx]));
+  ctl.append(F.playBtn, remoteBtn(() => [key, idx], () => key));
   F.head.append(F.check, F.name, stats, ctl, bar);
   F.el.append(F.head);
   return F;
@@ -582,7 +660,8 @@ function updateFileRow(F, x) {
   if (F.statsText.textContent !== line) F.statsText.textContent = line;
   const w = `${(f.progress * 100).toFixed(2)}%`;
   if (F.fill.style.width !== w) F.fill.style.width = w;
-  const cls = `torrent ep efile s-${done ? 'completed' : t.state}`;
+  const cls = `torrent ep efile s-${done ? 'completed' : t.state}${t.remote ? ' remote' : ''}`;
+  setDevTag(F.dev, t.remote || null);
   if (F.el.className !== cls) F.el.className = cls;
   const on = !!watched[`${key}:${f.file_index}`];
   if (F.watched !== on) { F.watched = on; F.check.classList.toggle('on', on); F.check.title = on ? 'Watched — click to unmark' : 'Mark as watched'; }
@@ -696,7 +775,7 @@ function reloadWatched() {
 }
 async function mainIndex(key) {
   if (mainFile.has(key)) return mainFile.get(key);
-  const media = (await invoke('list_files', { key })).filter((f) => f.kind === 'video' || f.kind === 'audio');
+  const media = (await listFiles(key)).filter((f) => f.kind === 'video' || f.kind === 'audio');
   if (!media.length) throw 'NOT_FOUND: no video or audio in this torrent';
   const idx = media.reduce((a, b) => (b.size > a.size ? b : a)).index;
   mainFile.set(key, idx);
@@ -831,7 +910,8 @@ const ART_MAX = 2;
 let artBusy = 0;
 
 function wantArtwork(t) {
-  if (!art.has(t.key)) art.set(t.key, { done: false, busy: false, tries: 0, next: 0 });
+  const dev = t.remote ? t.remote.id : null; // other Mac's item: art via remote_art
+  if (!art.has(t.key) || art.get(t.key).dev !== dev) art.set(t.key, { done: false, busy: false, tries: 0, next: 0, dev });
   const a = art.get(t.key);
   a.eligible = t.state !== 'resolving' && t.id != null;
 }
@@ -842,13 +922,16 @@ function pumpArtwork() {
     if (artBusy >= ART_MAX) return;
     if (a.done || a.busy || !a.eligible || now < a.next) continue;
     a.busy = true; artBusy++;
-    invoke('get_artwork', { key }).then((res) => {
+    const req = a.dev
+      ? invoke('remote_art', { deviceId: a.dev, key, kind: 'poster' }).then((url) => ({ poster: url || null, kind: 'poster', pri: 2 }))
+      : invoke('get_artwork', { key });
+    req.then((res) => {
       a.done = true;
-      if (res && res.poster) showArtwork(key, res.poster, res.kind, 1);
+      if (res && res.poster) showArtwork(key, res.poster, res.kind, res.pri || 1);
     }, (e) => {
       a.tries++;
       a.next = Date.now() + Math.min(60e3, 3e3 * 2 ** (a.tries - 1));
-      if (errCode(e) === 'NOT_FOUND') a.done = true;
+      if (errCode(e) === 'NOT_FOUND' || (a.dev && missingCmd(e))) a.done = true;
     }).finally(() => { a.busy = false; artBusy--; pumpArtwork(); });
   }
 }
@@ -871,6 +954,8 @@ function showArtwork(key, url, kind, pri) {
     r.head.classList.toggle('k-backdrop', kind === 'backdrop');
     r.head.classList.toggle('k-poster', kind !== 'backdrop');
     requestAnimationFrame(() => requestAnimationFrame(() => r.head.classList.add('art-on')));
+    const mm = meta.get(key);
+    if (mm && mm.dev && kind === 'poster') { mm.poster = url; if (openKey === key) updatePanel(key); }
   };
   img.src = url;
 }
@@ -883,8 +968,17 @@ const META_MAX = 2;
 let metaBusy = 0;
 
 function wantMeta(t) {
-  if (!meta.has(t.key)) meta.set(t.key, { done: false, busy: false, tries: 0, next: 0, info: null, poster: null });
-  meta.get(t.key).eligible = t.state !== 'resolving' && t.id != null && !!t.output_path;
+  const dev = t.remote ? t.remote.id : null;
+  if (!meta.has(t.key) || meta.get(t.key).dev !== dev) meta.set(t.key, { done: false, busy: false, tries: 0, next: 0, info: null, poster: null, dev });
+  const m = meta.get(t.key);
+  if (dev) {
+    // Other Mac's item: media info came with remote_library.
+    m.done = true;
+    const ro = remoteByKey.get(t.key), info = (ro && ro.media) || null;
+    if (JSON.stringify(m.info) !== JSON.stringify(info)) setInfo(t.key, info);
+    return;
+  }
+  m.eligible = t.state !== 'resolving' && t.id != null && !!t.output_path;
 }
 
 function pumpMeta() {
@@ -912,7 +1006,10 @@ function setInfo(key, info) {
   m.poster = null;
   const r = rows.get(key);
   if (r && r.last) updateRow(r, r.last);
-  if (matched(info) && info.imdb_id) {
+  if (m.dev) {
+    // Poster from the other Mac (the art pump fetches it; reuse it for the panel).
+    if (r && r.artUrl) m.poster = r.artUrl;
+  } else if (matched(info) && info.imdb_id) {
     invoke('get_media_image', { key, kind: 'poster' }).then((url) => {
       if (meta.get(key) !== m || m.info !== info) return;
       m.poster = url;
@@ -935,6 +1032,11 @@ function toggle(key) {
   r.panel = buildPanel(key);
   r.el.append(r.panel.el);
   updatePanel(key);
+  loadDetails(key, r);
+}
+
+function loadDetails(key, r) {
+  if (remoteOnly(key)) return; // the other Mac's torrent: only the info hash is known here
   invoke('get_torrent_details', { key }).then((d) => { r.details = d; if (r.panel) fillMore(r.panel, key, d); }, () => {});
 }
 
@@ -994,9 +1096,9 @@ function updatePanel(key) {
   const r = rows.get(key);
   if (!r || !r.panel || !r.last) return;
   const p = r.panel, t = r.last, m = meta.get(key) || {};
-  const line = torrentStats(t);
+  const line = (t.remote ? `On ${t.remote.name}${t.remote.online ? '' : ' (offline)'} · ` : '') + torrentStats(t);
   if (p.stats.textContent !== line) p.stats.textContent = line;
-  const path = t.output_path || (r.details && r.details.save_path) || '';
+  const path = t.remote ? '' : t.output_path || (r.details && r.details.save_path) || '';
   if (p.path.textContent !== path) p.path.textContent = path;
   p.path.hidden = !path;
   if (p.info !== m.info) { p.info = m.info; p.poster = undefined; renderMedia(p, key, m.info); }
@@ -1015,10 +1117,11 @@ function renderMedia(p, key, m) {
   if (!m) return;
   p.search = h('div', 'msearch');
   p.search.hidden = true;
+  const ro = !!remoteOnly(key); // matching happens on the Mac that has the files
   if (m.needs_match) {
     const row = h('div', 'nomatch');
-    row.append(h('span', null, `No match for “${m.title || 'this torrent'}”`),
-      linkBtn('Match', 'btn', () => openSearch(p, key, m)));
+    row.append(h('span', null, `No match for “${m.title || 'this torrent'}”`));
+    if (!ro) row.append(linkBtn('Match', 'btn', () => openSearch(p, key, m)));
     p.media.append(row, p.search);
     return;
   }
@@ -1055,7 +1158,7 @@ function renderMedia(p, key, m) {
   const links = h('div', 'mlinks');
   const imdb = m.imdb_url || (m.imdb_id ? `https://www.imdb.com/title/${m.imdb_id}/` : null);
   if (imdb) links.append(linkBtn('IMDb ↗', null, () => invoke('open_external', { url: imdb }).catch(reportError)));
-  links.append(linkBtn('Wrong match?', 'muted', () => openSearch(p, key, m)));
+  if (!ro) links.append(linkBtn('Wrong match?', 'muted', () => openSearch(p, key, m)));
   col.append(links, p.search);
   p.media.append(p.posterEl, col);
 }
@@ -1122,7 +1225,7 @@ function fillMore(p, key, d) {
 // ---------- file list ----------
 async function loadFiles(key) {
   let files, msg = null;
-  try { files = await invoke('list_files', { key }); } catch (e) {
+  try { files = await listFiles(key); } catch (e) {
     msg = errCode(e) === 'NOT_READY' ? 'Getting metadata…' : errMsg(e);
   }
   const r = rows.get(key);
@@ -1152,7 +1255,7 @@ function fileRow(key, f) {
   const media = f.kind === 'video' || f.kind === 'audio';
   row.append(name, h('span', 'fsize', bytes(f.size)), row._pct,
     media ? iconBtn('play', 'Play', () => play(key, f.index)) : h('span', 'nop'));
-  if (media) row.append(remoteBtn(() => [key, f.index]));
+  if (media) row.append(remoteBtn(() => [key, f.index], () => key));
   return row;
 }
 
@@ -1443,10 +1546,10 @@ function followItem(gr) {
 }
 
 // ---------- continue watching ----------
-// Source: the player's "tide:resume:<key>:<fileIndex>" = seconds entries. The player window
-// is served from the same app origin, so it shares this localStorage (scanResume relies on
-// that too). No duration is stored, so the bar uses the matched runtime when known.
-// Order: most recently changed first — change times are tracked here ("tide:cwAt").
+// Source: resume_list — positions from both Macs, merged by the backend ({ key, file_index,
+// pos, dur, updated_at, device }), newest first. Fallback when that command is missing:
+// the player's "tide:resume:<key>:<fileIndex>" = seconds entries in the shared localStorage
+// (no duration there, so the bar uses the matched runtime; change times tracked in "tide:cwAt").
 const CW_MAX = 6;
 const cwEl = h('section', 'cw');
 cwEl.hidden = true;
@@ -1459,7 +1562,25 @@ let cwScanned = false;
 let cwAt = {};
 try { cwAt = JSON.parse(localStorage.getItem('tide:cwAt') || '{}') || {}; } catch { cwAt = {}; }
 
+let resumeList = null; // resume_list result; null = command unavailable -> localStorage
+let resumeListOk = true;
+let resumeLoading = false;
+function loadResume() {
+  if (!resumeListOk || resumeLoading) { renderContinue(); return Promise.resolve(); }
+  resumeLoading = true;
+  return invoke('resume_list').then((l) => { resumeList = Array.isArray(l) ? l : []; },
+    (e) => { if (missingCmd(e)) { resumeListOk = false; resumeList = null; } })
+    .finally(() => { resumeLoading = false; renderContinue(); });
+}
+let resumeTimer;
+const loadResumeSoon = () => { clearTimeout(resumeTimer); resumeTimer = setTimeout(loadResume, 400); };
+
 function resumeEntries() {
+  if (resumeList) {
+    return resumeList.filter((x) => x && x.key && isFinite(x.pos) && x.pos > 0).map((x) => ({
+      fk: `${x.key}:${x.file_index}`, lsKey: `tide:resume:${x.key}:${x.file_index}`, key: x.key, idx: Number(x.file_index),
+      secs: x.pos, dur: x.dur > 0 ? x.dur : 0, at: x.updated_at || 0, device: x.device || null }));
+  }
   let ls;
   try { ls = window.localStorage; } catch { return []; }
   const out = [];
@@ -1471,9 +1592,10 @@ function resumeEntries() {
       const secs = parseFloat(ls.getItem(m[0]));
       if (!isFinite(secs) || secs <= 0) continue;
       const fk = `${m[1]}:${m[2]}`;
+      const d = parseFloat(ls.getItem(`tide:dur:${fk}`));
       if ((cwScanned && cwVal.get(fk) !== secs) || !cwAt[fk]) { cwAt[fk] = cwScanned ? Date.now() : 1; dirty = true; }
       cwVal.set(fk, secs);
-      out.push({ fk, lsKey: m[0], key: m[1], idx: Number(m[2]), secs });
+      out.push({ fk, lsKey: m[0], key: m[1], idx: Number(m[2]), secs, dur: isFinite(d) && d > 0 ? d : 0, at: cwAt[fk] || 0 });
     }
   } catch { return []; }
   cwScanned = true;
@@ -1516,10 +1638,14 @@ function createCwCard(e) {
   x.title = 'Remove from Continue watching';
   x.addEventListener('click', (ev) => {
     ev.stopPropagation();
-    try { localStorage.removeItem(e.lsKey); } catch { /* ignore */ }
+    try { localStorage.removeItem(e.lsKey); localStorage.removeItem(e.lsKey.replace('tide:resume:', 'tide:dur:')); } catch { /* ignore */ }
+    if (resumeList) {
+      resumeList = resumeList.filter((r) => `${r.key}:${r.file_index}` !== e.fk);
+      invoke('resume_set', { key: e.key, fileIndex: e.idx, pos: 0, dur: 0 }).catch(() => {});
+    }
     renderContinue();
   });
-  const rb = remoteBtn(() => [e.key, e.idx]);
+  const rb = remoteBtn(() => [e.key, e.idx], () => e.key);
   rb.classList.add('cwr');
   C.el.append(C.pic, text, x, rb, C.bar);
   C.el.addEventListener('click', () => play(e.key, e.idx));
@@ -1530,7 +1656,7 @@ function createCwCard(e) {
 function renderContinue() {
   const entries = resumeEntries()
     .filter((e) => { const r = rows.get(e.key); return r && r.last && !watched[e.fk]; })
-    .sort((a, b) => (cwAt[b.fk] || 0) - (cwAt[a.fk] || 0) || a.fk.localeCompare(b.fk))
+    .sort((a, b) => b.at - a.at || a.fk.localeCompare(b.fk))
     .slice(0, CW_MAX);
   cwEl.hidden = !entries.length;
   const seen = new Set();
@@ -1540,9 +1666,9 @@ function renderContinue() {
     if (!C) { C = createCwCard(e); cwCards.set(e.fk, C); }
     const title = cwLabel(e);
     if (C.title.textContent !== title) { C.title.textContent = title; C.el.title = title; }
-    const info = infoOf(e.key);
-    const dur = info && info.runtime_min ? info.runtime_min * 60 : 0;
-    const sub = dur && e.secs < dur ? eta(dur - e.secs) : `Resume at ${clock(e.secs)}`;
+    const info = infoOf(e.key), ro = remoteOnly(e.key);
+    const dur = e.dur || (info && info.runtime_min ? info.runtime_min * 60 : 0);
+    const sub = (dur && e.secs < dur ? eta(dur - e.secs) : `Resume at ${clock(e.secs)}`) + (ro ? ` · on ${shortDev(ro.dev.name)}` : '');
     if (C.sub.textContent !== sub) C.sub.textContent = sub;
     const w = `${dur ? Math.min(100, (e.secs / dur) * 100).toFixed(1) : 0}%`;
     if (C.fill.style.width !== w) C.fill.style.width = w;
@@ -1557,7 +1683,8 @@ function renderContinue() {
   });
   for (const [fk, C] of cwCards) if (!seen.has(fk)) { C.el.remove(); cwCards.delete(fk); }
 }
-window.addEventListener('storage', (e) => { if (!e.key || RESUME_RE.test(e.key)) renderContinue(); });
+// The player mirrors positions into localStorage, so its writes also arrive here.
+window.addEventListener('storage', (e) => { if (!e.key || RESUME_RE.test(e.key)) loadResumeSoon(); });
 
 // ---------- library view (poster grid) ----------
 let view = 'list';
@@ -1615,7 +1742,9 @@ function libItems() {
       }
       const G = groupEls.get(gr.gid);
       const best = gr.keys.map((k) => rows.get(k)).filter((x) => x.artUrl).sort((a, b) => b.artPri - a.artPri)[0];
+      const rems = gr.keys.map((k) => rows.get(k).last.remote);
       items.push({ id: `s:${gr.keys[0]}`, series: true, keys: gr.keys, name: (G && G.name.textContent) || gr.name,
+        remote: rems.every(Boolean) ? rems[0] : null,
         sub: `${plural(eps, 'episode')}${seen ? ` · ${seen} watched` : ''}`, url: best ? best.artUrl : null,
         progress: live && total ? done / total : null, watched: eps > 0 && seen >= eps });
       continue;
@@ -1633,7 +1762,7 @@ function libItems() {
     }
     const rt = rating(m);
     if (rt) sub = sub ? `${sub} · ★ ${rt}` : `★ ${rt}`;
-    items.push({ id: `t:${t.key}`, key: t.key, name, sub, url: r.artUrl || null,
+    items.push({ id: `t:${t.key}`, key: t.key, name, sub, url: r.artUrl || null, remote: t.remote || null,
       progress: downloadingish(t) ? t.progress : null, watched: isWatched(t.key) });
   }
   return items;
@@ -1641,11 +1770,12 @@ function libItems() {
 
 function createTile(it) {
   const L = { el: h('div', 'ltile'), pic: h('div', 'lpic'), ph: h('div', 'lph'), name: h('div', 'lname'), sub: h('div', 'lsub'),
-    bar: h('div', 'lbar'), fill: h('i'), badge: h('span', 'lbadge', '✓') };
+    bar: h('div', 'lbar'), fill: h('i'), badge: h('span', 'lbadge', '✓'), dev: h('span', 'devtag ldev') };
   L.el.setAttribute('role', 'button');
   L.el.tabIndex = 0;
   L.bar.append(L.fill);
-  L.pic.append(L.ph, L.badge, L.bar);
+  L.dev.hidden = true;
+  L.pic.append(L.ph, L.badge, L.dev, L.bar);
   L.el.append(L.pic, L.name, L.sub);
   const open = () => (L.item.series ? showSeries(L.item.keys) : openSheet(L.item.key));
   L.el.addEventListener('click', open);
@@ -1672,6 +1802,9 @@ function renderLibrary() {
     const w = `${((it.progress || 0) * 100).toFixed(2)}%`;
     if (L.fill.style.width !== w) L.fill.style.width = w;
     L.badge.hidden = !it.watched;
+    setDevTag(L.dev, it.remote);
+    const cls = `ltile${it.remote ? ' remote' : ''}`;
+    if (L.el.className !== cls) L.el.className = cls;
     if (libGrid.children[i] !== L.el) libGrid.insertBefore(L.el, libGrid.children[i] || null);
   });
   for (const [id, L] of libTiles) if (!seen.has(id)) { L.el.remove(); libTiles.delete(id); }
@@ -1700,7 +1833,7 @@ function openSheet(key) {
   libBox.scrollTop = 0;
   document.body.classList.add('sheet-open');
   updatePanel(key);
-  invoke('get_torrent_details', { key }).then((d) => { r.details = d; if (r.panel) fillMore(r.panel, key, d); }, () => {});
+  loadDetails(key, r);
 }
 
 // Series -> the group in the list view, expanded and briefly highlighted.
@@ -1823,7 +1956,45 @@ var MOCK = T ? null : (() => {
   const rDevs = [{ id: 'd1', name: "mshn's Mac mini", host: '192.168.1.30', port: 47900, online: true }];
   let rEnabled = true;
   const rStatus = () => ({ enabled: rEnabled, port: rEnabled ? 47900 : null, name: 'MacBook Air', lanIp: '192.168.1.20', devices: rDevs.map((d) => ({ ...d })) });
+  // Mac↔Mac sync: two items stored only on the Mac mini (a movie, and a Severance episode
+  // that groups with the local S02E05), plus resume positions from both Macs.
+  const R1 = hash(20), R2 = hash(21);
+  const rLibRows = [
+    { ...mk(20, 'Elephants.Dream.2006.1080p.BluRay.x264', 'completed', 1.1 * GB, 1), output_path: '/Users/mshn/Tidebox/Elephants Dream (2006)' },
+    { ...mk(21, 'Severance.S02E04.1080p.ATVP.WEB-DL.DDP5.1.H.264-NTb', 'completed', 2.3 * GB, 1), output_path: '/Users/mshn/Tidebox/Severance S02E04' },
+  ];
+  const nowS = () => Math.floor(Date.now() / 1000);
+  const resumeDb = {}; // "key:idx" -> { pos, dur, updated_at, device }
+  [[7, 0, 1260, 3000, 'MacBook Air', 60], [9, 0, 1530, 2700, 'MacBook Air', 3600], [12, 2, 610, 3300, 'MacBook Air', 7200], [1, 0, 240, 600, 'MacBook Air', 9000],
+    [21, 0, 1980, 3120, "mshn's Mac mini", 30]].forEach(([n, i, pos, dur, device, ago]) => {
+    resumeDb[`${hash(n)}:${i}`] = { pos, dur, updated_at: nowS() - ago, device };
+  });
+  let lastSync = nowS() - 120;
   const api = {
+    remote_library: () => [{ device_id: 'd1', device_name: "mshn's Mac mini", online: true, rows: rLibRows.map((t) => ({ ...t })),
+      media: {
+        [R1]: { ...base, imdb_id: 'tt0807840', media_type: 'movie', title: 'Elephants Dream', year: 2006, genres: ['Animation', 'Short', 'Sci-Fi'], runtime_min: 11, imdb_rating: 6.5,
+          overview: 'Two strange characters explore a capricious and seemingly infinite machine.' },
+        [R2]: { ...base, imdb_id: 'tt11280740', media_type: 'tv', title: 'Severance', year: 2022, season: 2, episode: 4, episode_title: 'Woe’s Hollow',
+          genres: ['Drama', 'Mystery', 'Sci-Fi'], runtime_min: 52, imdb_rating: 8.7, overview: 'Mark leads a team of office workers whose memories have been surgically divided between their work and personal lives.' },
+      },
+      files: {
+        [R1]: [{ index: 0, name: 'Elephants.Dream.2006.1080p.mp4', size: 1.1 * GB, progress_bytes: 1.1 * GB, progress: 1, kind: 'video', playable_builtin: true }],
+        [R2]: [{ index: 0, name: 'Severance.S02E04.1080p.mkv', size: 2.3 * GB, progress_bytes: 2.3 * GB, progress: 1, kind: 'video', playable_builtin: false },
+          { index: 1, name: 'Severance.S02E04.en.srt', size: 58e3, progress_bytes: 58e3, progress: 1, kind: 'subtitle', playable_builtin: false }],
+      } }],
+    remote_play_local: () => null,
+    remote_art: ({ key }) => (key === R1 ? ED_POSTER : key === R2 ? MOCK_MEDIA_POSTERS[hash(7)] : err('NOT_FOUND: no image')),
+    sync_status: () => ({ devices: rDevs.map((d) => ({ id: d.id, name: d.name, online: d.online, last_sync: lastSync, error: d.id === 'd2' ? 'NETWORK: connection refused' : null })) }),
+    sync_now: () => { lastSync = nowS(); return null; },
+    resume_list: () => Object.entries(resumeDb).map(([fk, v]) => ({ key: fk.split(':')[0], file_index: Number(fk.split(':')[1]), ...v }))
+      .sort((a, b) => b.updated_at - a.updated_at),
+    resume_get: ({ key, fileIndex }) => { const v = resumeDb[`${key}:${fileIndex}`]; return v ? { pos: v.pos, dur: v.dur, updated_at: v.updated_at } : null; },
+    resume_set: ({ key, fileIndex, pos, dur }) => {
+      if (!pos) delete resumeDb[`${key}:${fileIndex}`];
+      else resumeDb[`${key}:${fileIndex}`] = { pos, dur, updated_at: nowS(), device: 'MacBook Air' };
+      return null;
+    },
     remote_status: rStatus,
     remote_set_enabled: ({ enabled }) => { rEnabled = enabled; return rStatus(); },
     remote_discover: () => [{ id: 'd1', name: "mshn's Mac mini", host: '192.168.1.30', port: 47900, paired: !!rDevs.find((d) => d.id === 'd1') },
@@ -1980,6 +2151,9 @@ var MOCK = T ? null : (() => {
       <text x="100" y="282" text-anchor="middle" font-family="Georgia" font-size="17" fill="#e8e1d2">THE LIGHTHOUSE KEEPERS</text>`);
   const MOCK_MEDIA_POSTERS = { [hash(8)]: LH, [hash(9)]: LH, [hash(10)]: LH, [hash(11)]: LH, [hash(1)]: MOCK_POSTERS[hash(1)], [hash(7)]: svgUrl(`<rect width="200" height="300" fill="#e9ecef"/><rect x="40" y="90" width="120" height="80" fill="#0b3d5c"/>
       <text x="100" y="250" text-anchor="middle" font-family="Helvetica" font-size="24" letter-spacing="4" fill="#0b3d5c">SEVERANCE</text>`) };
+  const ED_POSTER = svgUrl(`<rect width="200" height="300" fill="#2b1d12"/><circle cx="100" cy="120" r="70" fill="none" stroke="#d98b3a" stroke-width="10"/>
+      <circle cx="100" cy="120" r="38" fill="none" stroke="#a65d22" stroke-width="6"/><path d="M30 230h140" stroke="#d98b3a" stroke-width="4"/>
+      <text x="100" y="272" text-anchor="middle" font-family="Georgia" font-size="20" fill="#f0d2a8">ELEPHANTS DREAM</text>`);
   MOCK_RESULTS[0].poster_url = MOCK_POSTERS[hash(2)];
   MOCK_RESULTS[1].poster_url = MOCK_POSTERS[hash(2)];
 
@@ -2016,7 +2190,8 @@ const rOnL = h('label', 'check'); rOnL.append(rOn, document.createTextNode(' All
 const rList = h('div', 'rlist');
 const rFind = h('button', 'wlink', 'Find Macs…'); rFind.type = 'button';
 const rAdd = h('button', 'wlink', 'Add by IP…'); rAdd.type = 'button';
-const rBtns = h('div', 'nrow rbtns'); rBtns.append(rFind, rAdd);
+const rSync = h('button', 'wlink', 'Sync now'); rSync.type = 'button'; rSync.hidden = true;
+const rBtns = h('div', 'nrow rbtns'); rBtns.append(rFind, rAdd, rSync);
 const rExtra = h('div', 'rextra'); // discover results / IP input / code input
 const rMsg = h('p', 'wstatus');
 rSec.append(rMe, rOnL, rList, rBtns, rExtra, rMsg);
@@ -2046,10 +2221,48 @@ function renderRemote() {
     name.title = `${d.host}:${d.port}`;
     const un = h('button', 'wlink', 'Unpair'); un.type = 'button';
     un.addEventListener('click', () => invoke('remote_unpair', { id: d.id }).then(loadRemote, reportError));
-    row.append(dot, name, un);
+    row.append(dot, name);
+    const st = syncLine(d.id);
+    if (st) row.append(st);
+    row.append(un);
     return row;
   }));
+  rSync.hidden = !syncOk || !(s.devices || []).length;
 }
+
+// ---------- Mac↔Mac sync status (sync_status / sync_now) ----------
+let syncSt = null; // { devices: [{ id, name, online, last_sync, error }] }
+let syncOk = true;
+function agoText(ts) {
+  if (!ts) return 'Not synced yet';
+  const ms = ts > 1e12 ? ts : ts * 1000; // seconds or milliseconds
+  const s = Math.max(0, (Date.now() - ms) / 1000);
+  if (s < 45) return 'Synced just now';
+  if (s < 3600) return `Synced ${Math.max(1, Math.round(s / 60))} min ago`;
+  if (s < 86400) return `Synced ${Math.round(s / 3600)} h ago`;
+  return `Synced ${plural(Math.round(s / 86400), 'day')} ago`;
+}
+function syncLine(id) {
+  const d = syncSt && (syncSt.devices || []).find((x) => x.id === id);
+  if (!d) return null;
+  const el = h('span', `rsync${d.error ? ' bad' : ''}`, d.error ? 'Sync failed' : agoText(d.last_sync));
+  el.title = d.error ? errMsg(d.error) : d.last_sync ? new Date(d.last_sync > 1e12 ? d.last_sync : d.last_sync * 1000).toLocaleString() : '';
+  return el;
+}
+function loadSync() {
+  if (!syncOk) return Promise.resolve();
+  return invoke('sync_status').then((st) => { syncSt = st || null; renderRemote(); },
+    (e) => { if (missingCmd(e)) { syncOk = false; syncSt = null; renderRemote(); } });
+}
+rSync.addEventListener('click', () => {
+  rSync.disabled = true;
+  rSay('Syncing…');
+  invoke('sync_now')
+    .then(() => Promise.all([loadSync(), loadRemoteLib(), loadResume()]))
+    .then(() => rSay(''), (e) => { if (missingCmd(e)) { syncOk = false; renderRemote(); rSay(''); } else rSay(errMsg(e), true); })
+    .finally(() => { rSync.disabled = false; });
+});
+function syncRefresh() { loadRemoteLib(); loadResume(); loadSync(); }
 function loadRemote() { return invoke('remote_status').then((s) => { remote = s; renderRemote(); }, () => {}); }
 rOn.addEventListener('change', () => invoke('remote_set_enabled', { enabled: rOn.checked })
   .then((s) => { remote = s; renderRemote(); }, (e) => { rOn.checked = !rOn.checked; reportError(e); }));
@@ -2104,7 +2317,7 @@ rAdd.addEventListener('click', () => {
   rSay('');
   i.focus();
 });
-wGear.addEventListener('click', () => { if (!wPop.hidden) { rExtra.replaceChildren(); rSay(''); loadRemote(); } });
+wGear.addEventListener('click', () => { if (!wPop.hidden) { rExtra.replaceChildren(); rSay(''); loadRemote(); loadSync(); } });
 
 // Incoming pair request (this Mac shows the code the other one must type).
 const prCard = h('div', 'prcard');
@@ -2134,8 +2347,12 @@ if (T) {
 }
 loadMoreSettings();
 loadRemote();
+syncRefresh();
+setInterval(() => { loadRemoteLib(); loadResume(); }, 30000);
+window.addEventListener('focus', loadResume);
 if (T) {
-  listen('remote-devices-updated', () => loadRemote());
+  listen('sync-updated', () => syncRefresh());
+  listen('remote-devices-updated', () => { loadRemote(); loadRemoteLib(); });
   listen('remote-pair-request', (e) => showPairRequest(e.payload || {}));
 }
 loadWatcher().then(() => invoke('watcher_check', { force: false })).then(setEpisodes, () => {});

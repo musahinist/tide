@@ -10,6 +10,10 @@
 //! - `POST /v1/pair/start`, `POST /v1/pair/finish` (6-digit code shown on this Mac)
 //! - `GET|HEAD /v1/relay/<rid>/<name>` (loopback only): the builtin player loads remote
 //!   streams through 127.0.0.1 so WebKit never sees plain-http LAN media.
+//! - Mac↔Mac sync (all Bearer + `X-Tide-Id`): `GET /v1/library` (this Mac's rows,
+//!   offline MediaInfo, media files), `GET /v1/art/<key>/<poster|backdrop>` (sidecar
+//!   bytes), `POST /v1/stream-token {key,fileIndex}` (tokenized stream + subtitle URLs,
+//!   a `PlayRequest`), `GET /v1/sync/state?since=<ms>`, `POST /v1/sync/push` (sync.rs).
 //!
 //! Stream/subtitle tokens are random, per play request, bound to one torrent file
 //! (+ its subtitle files) and expire; nothing else on disk is reachable.
@@ -45,6 +49,9 @@ const PAIR_TTL: Duration = Duration::from_secs(120);
 const PAIR_MAX_ATTEMPTS: u32 = 5;
 const MAX_HEADER: usize = 16 * 1024;
 const MAX_BODY: usize = 64 * 1024;
+/// `POST /v1/sync/push` carries watch state for the whole library.
+const MAX_SYNC_BODY: usize = 8 * 1024 * 1024;
+const ART_CACHE: usize = 64;
 const SUB_MAX_BYTES: usize = 2 * 1024 * 1024;
 
 fn internal<E: std::fmt::Display>(e: E) -> String {
@@ -110,6 +117,10 @@ pub struct RemoteState {
     relays: Mutex<HashMap<String, String>>,
     pairs: Mutex<HashMap<String, PendingPair>>,
     http: reqwest::Client,
+    /// Last `/v1/library` answer per paired device (shown while it is offline).
+    library: Mutex<HashMap<String, LibrarySnapshot>>,
+    /// `(device, key, kind)` -> data URL of remote artwork.
+    art: Mutex<Vec<((String, String, String), String)>>,
 }
 
 impl RemoteState {
@@ -133,6 +144,8 @@ impl RemoteState {
             grants: Mutex::new(HashMap::new()),
             relays: Mutex::new(HashMap::new()),
             pairs: Mutex::new(HashMap::new()),
+            library: Mutex::new(HashMap::new()),
+            art: Mutex::new(Vec::new()),
             http: reqwest::Client::builder()
                 .no_proxy()
                 .connect_timeout(Duration::from_secs(3))
@@ -146,8 +159,18 @@ impl RemoteState {
         rs
     }
 
-    fn self_id(&self) -> String {
+    pub fn self_id(&self) -> String {
         self.cfg.lock().unwrap().self_id.clone()
+    }
+
+    #[cfg(test)]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Paired devices.
+    pub fn devices(&self) -> Vec<Device> {
+        self.cfg.lock().unwrap().devices.clone()
     }
 
     pub fn port(&self) -> Option<u16> {
@@ -157,11 +180,11 @@ impl RemoteState {
         }
     }
 
-    fn device(&self, id: &str) -> Option<Device> {
+    pub fn device(&self, id: &str) -> Option<Device> {
         self.cfg.lock().unwrap().devices.iter().find(|d| d.id == id).cloned()
     }
 
-    fn upsert_device(&self, dev: Device) {
+    pub(crate) fn upsert_device(&self, dev: Device) {
         {
             let mut c = self.cfg.lock().unwrap();
             c.devices.retain(|d| d.id != dev.id);
@@ -380,6 +403,8 @@ fn mime_for(name: &str) -> &'static str {
 struct Request {
     method: String,
     path: String,
+    /// Raw query string (after `?`), may be empty.
+    query: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
@@ -387,6 +412,12 @@ struct Request {
 impl Request {
     fn header(&self, name: &str) -> Option<&str> {
         self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    }
+
+    fn query_param(&self, name: &str) -> Option<String> {
+        self.query.split('&').filter_map(|kv| kv.split_once('=')).find(|(k, _)| *k == name).map(|(_, v)| {
+            urlencoding::decode(v).map(|c| c.into_owned()).unwrap_or_else(|_| v.to_string())
+        })
     }
 }
 
@@ -412,7 +443,10 @@ async fn read_request<R: AsyncRead + Unpin>(sock: &mut R) -> std::io::Result<Req
     let mut rl = lines.next().unwrap_or("").split(' ');
     let method = rl.next().unwrap_or("").to_string();
     let target = rl.next().unwrap_or("");
-    let path = target.split('?').next().unwrap_or("").to_string();
+    let (path, query) = match target.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (target.to_string(), String::new()),
+    };
     let headers: Vec<(String, String)> = lines
         .filter_map(|l| l.split_once(':'))
         .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
@@ -422,7 +456,8 @@ async fn read_request<R: AsyncRead + Unpin>(sock: &mut R) -> std::io::Result<Req
         .find(|(k, _)| k == "content-length")
         .and_then(|(_, v)| v.parse().ok())
         .unwrap_or(0);
-    if len > MAX_BODY {
+    let limit = if path == "/v1/sync/push" { MAX_SYNC_BODY } else { MAX_BODY };
+    if len > limit {
         return Err(bad("body too large"));
     }
     let mut body = buf[head_end + 4..].to_vec();
@@ -434,7 +469,7 @@ async fn read_request<R: AsyncRead + Unpin>(sock: &mut R) -> std::io::Result<Req
         body.extend_from_slice(&tmp[..n]);
     }
     body.truncate(len);
-    Ok(Request { method, path, headers, body })
+    Ok(Request { method, path, query, headers, body })
 }
 
 fn reason(code: u16) -> &'static str {
@@ -566,7 +601,7 @@ async fn proxy<W: AsyncWriteExt + Unpin>(w: &mut W, http: &reqwest::Client, req:
 
 // ------------------------------------------------------------------ server core
 
-type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub(crate) type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// What the server needs from the app (mocked in tests).
 pub(crate) trait Backend: Send + Sync + 'static {
@@ -575,6 +610,65 @@ pub(crate) trait Backend: Send + Sync + 'static {
     /// Play an already validated request on this Mac.
     fn play(&self, req: PlayRequest) -> BoxFut<'_, Result<(), String>>;
     fn emit(&self, event: &str, payload: serde_json::Value);
+
+    /// This Mac's library for `GET /v1/library` (no network).
+    fn library(&self) -> BoxFut<'_, Result<Library, String>> {
+        Box::pin(async { Err("NOT_FOUND: no library".to_string()) })
+    }
+    /// Sidecar artwork `(bytes, mime)`; `kind` is "poster" | "backdrop".
+    fn art(&self, _key: String, _kind: String) -> BoxFut<'_, Result<(Vec<u8>, String), String>> {
+        Box::pin(async { Err("NOT_FOUND: no artwork".to_string()) })
+    }
+    /// Title + subtitle files of a media file (for `POST /v1/stream-token`).
+    fn stream_info(&self, _key: String, _idx: usize) -> BoxFut<'_, Result<StreamInfo, String>> {
+        Box::pin(async { Err("NOT_FOUND: no such file".to_string()) })
+    }
+    /// `GET /v1/sync/state?since=` from paired device `from`.
+    fn sync_state(&self, _from: &str, _since: u64) -> Result<serde_json::Value, String> {
+        Err("NOT_FOUND: sync unavailable".into())
+    }
+    /// `POST /v1/sync/push` from paired device `from`.
+    fn sync_push(&self, _from: &str, _body: serde_json::Value) -> Result<serde_json::Value, String> {
+        Err("NOT_FOUND: sync unavailable".into())
+    }
+}
+
+/// What `stream-token` needs to know about one media file.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StreamInfo {
+    pub title: String,
+    /// (torrent file index, label, lang), default subtitle first.
+    pub subs: Vec<(usize, String, Option<String>)>,
+    pub playable_builtin: bool,
+}
+
+/// `GET /v1/library` body.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Library {
+    #[serde(default)]
+    pub rows: Vec<crate::types::TorrentRow>,
+    #[serde(default)]
+    pub media: std::collections::BTreeMap<String, crate::types::MediaInfo>,
+    #[serde(default)]
+    pub files: std::collections::BTreeMap<String, Vec<crate::types::FileRow>>,
+}
+
+/// Cached library of one paired device.
+#[derive(Debug, Clone)]
+struct LibrarySnapshot {
+    name: String,
+    lib: Library,
+}
+
+/// One entry of `remote_library`.
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoteLibrary {
+    pub device_id: String,
+    pub device_name: String,
+    pub online: bool,
+    pub rows: Vec<crate::types::TorrentRow>,
+    pub media: std::collections::BTreeMap<String, crate::types::MediaInfo>,
+    pub files: std::collections::BTreeMap<String, Vec<crate::types::FileRow>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -687,12 +781,8 @@ async fn route(w: &mut TcpStream, req: &Request, peer: IpAddr, ctx: &Ctx) -> std
             }
         }
         ("POST", ["v1", "play"]) => {
-            let id = req.header("x-tide-id").unwrap_or("");
-            let bearer = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
-            let ok = ctx.rs.device(id).is_some_and(|d| ct_eq(d.secret.as_bytes(), bearer.as_bytes()));
-            if !ok || bearer.is_empty() {
-                return respond_err(w, 401, "unauthorized").await;
-            }
+            let Some(id) = authed(req, ctx) else { return respond_err(w, 401, "unauthorized").await };
+            let id = id.as_str();
             let Ok(pr) = serde_json::from_slice::<PlayRequest>(&req.body) else {
                 return respond_err(w, 400, "bad request").await;
             };
@@ -705,10 +795,106 @@ async fn route(w: &mut TcpStream, req: &Request, peer: IpAddr, ctx: &Ctx) -> std
                 Err(e) => respond_err(w, 500, &e).await,
             }
         }
+        ("GET", ["v1", "library"]) => {
+            let Some(id) = authed(req, ctx) else { return respond_err(w, 401, "unauthorized").await };
+            ctx.rs.touch_device(&id, None, None, Some(peer));
+            match ctx.be.library().await {
+                Ok(lib) => {
+                    let mut v = serde_json::to_value(&lib).unwrap_or_default();
+                    v["device_id"] = json!(ctx.rs.self_id());
+                    v["device_name"] = json!(ctx.rs.name);
+                    respond_json(w, 200, v).await
+                }
+                Err(e) => respond_err(w, 500, &e).await,
+            }
+        }
+        ("GET", ["v1", "art", key, kind]) => {
+            if authed(req, ctx).is_none() {
+                return respond_err(w, 401, "unauthorized").await;
+            }
+            let key = key.to_ascii_lowercase();
+            if !is_hex(&key, 40) || !matches!(*kind, "poster" | "backdrop") {
+                return respond_err(w, 404, "not found").await;
+            }
+            match ctx.be.art(key, kind.to_string()).await {
+                Ok((bytes, mime)) => respond(w, 200, &mime, &bytes).await,
+                Err(e) => respond_err(w, 404, &e).await,
+            }
+        }
+        ("POST", ["v1", "stream-token"]) => {
+            let Some(id) = authed(req, ctx) else { return respond_err(w, 401, "unauthorized").await };
+            #[derive(Deserialize)]
+            struct TokReq {
+                key: String,
+                #[serde(alias = "fileIndex")]
+                file_index: usize,
+            }
+            let Ok(tr) = serde_json::from_slice::<TokReq>(&req.body) else {
+                return respond_err(w, 400, "bad request").await;
+            };
+            let key = tr.key.to_ascii_lowercase();
+            if !is_hex(&key, 40) {
+                return respond_err(w, 400, "bad key").await;
+            }
+            ctx.rs.touch_device(&id, None, None, Some(peer));
+            let info = match ctx.be.stream_info(key.clone(), tr.file_index).await {
+                Ok(i) => i,
+                Err(e) => return respond_err(w, 404, &e).await,
+            };
+            // URLs use the address the peer reached us at.
+            let Ok(local) = w.local_addr() else { return respond_err(w, 500, "no local address").await };
+            let port = ctx.rs.port().unwrap_or(local.port());
+            let base = format!("http://{}:{port}", url_host(local.ip().to_canonical()));
+            let pr = build_request(&ctx.rs, &base, &key, tr.file_index, &info);
+            respond_json(w, 200, serde_json::to_value(&pr).unwrap_or_default()).await
+        }
+        ("GET", ["v1", "sync", "state"]) => {
+            let Some(id) = authed(req, ctx) else { return respond_err(w, 401, "unauthorized").await };
+            ctx.rs.touch_device(&id, None, None, Some(peer));
+            let since = req.query_param("since").and_then(|s| s.parse().ok()).unwrap_or(0);
+            match ctx.be.sync_state(&id, since) {
+                Ok(v) => respond_json(w, 200, v).await,
+                Err(e) => respond_err(w, 500, &e).await,
+            }
+        }
+        ("POST", ["v1", "sync", "push"]) => {
+            let Some(id) = authed(req, ctx) else { return respond_err(w, 401, "unauthorized").await };
+            let Ok(body) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
+                return respond_err(w, 400, "bad request").await;
+            };
+            ctx.rs.touch_device(&id, None, None, Some(peer));
+            match ctx.be.sync_push(&id, body) {
+                Ok(v) => respond_json(w, 200, v).await,
+                Err(e) => respond_err(w, 400, &e).await,
+            }
+        }
         ("POST", ["v1", "pair", "start"]) => pair_start_srv(w, req, ctx).await,
         ("POST", ["v1", "pair", "finish"]) => pair_finish_srv(w, req, peer, ctx).await,
         (m, ["v1", ..]) if m != "GET" && m != "HEAD" && m != "POST" => respond_err(w, 405, "method").await,
         _ => respond_err(w, 404, "not found").await,
+    }
+}
+
+/// Paired device id when the request carries its Bearer secret + `X-Tide-Id`.
+fn authed(req: &Request, ctx: &Ctx) -> Option<String> {
+    let id = req.header("x-tide-id").unwrap_or("");
+    let bearer = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
+    let ok = !bearer.is_empty() && ctx.rs.device(id).is_some_and(|d| ct_eq(d.secret.as_bytes(), bearer.as_bytes()));
+    ok.then(|| id.to_string())
+}
+
+/// Grant a token for `key`/`idx` (+ its subtitle files) and build the URLs under `base`.
+fn build_request(rs: &RemoteState, base: &str, key: &str, idx: usize, info: &StreamInfo) -> PlayRequest {
+    let token = rs.grant(key, idx, info.subs.iter().map(|(i, _, _)| *i));
+    PlayRequest {
+        url: format!("{base}/v1/stream/{token}/{key}/{idx}/{}", urlencoding::encode(&info.title)),
+        subtitles: info
+            .subs
+            .iter()
+            .map(|(i, label, lang)| RemoteSub { label: label.clone(), lang: lang.clone(), url: format!("{base}/v1/sub/{token}/{key}/{i}.vtt") })
+            .collect(),
+        mode_hint: Some(if info.playable_builtin { "builtin" } else { "vlc" }.into()),
+        title: info.title.clone(),
     }
 }
 
@@ -789,7 +975,7 @@ async fn pair_finish_srv(w: &mut TcpStream, req: &Request, peer: IpAddr, ctx: &C
 
 // ------------------------------------------------------------------ client side
 
-async fn post_json(
+pub(crate) async fn post_json(
     rs: &RemoteState,
     addr: SocketAddr,
     path: &str,
@@ -810,19 +996,75 @@ async fn post_json(
     let resp = rb.send().await.map_err(|e| format!("UNREACHABLE: {e}"))?;
     let status = resp.status().as_u16();
     let text = resp.text().await.map_err(|e| format!("UNREACHABLE: {e}"))?;
-    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    answer(status, text.as_bytes())
+}
+
+fn answer(status: u16, body: &[u8]) -> Result<serde_json::Value, String> {
+    let v: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
     if (200..300).contains(&status) {
         Ok(v)
     } else {
         let msg = v.get("error").and_then(|e| e.as_str()).unwrap_or("request failed");
         let kind = match status {
             401 => "UNAUTHORIZED",
+            404 => "NOT_FOUND",
             410 => "EXPIRED",
             429 => "RATE_LIMITED",
             _ => "REMOTE_ERROR",
         };
         Err(format!("{kind}: {msg}"))
     }
+}
+
+/// Authenticated GET → (content type, body). Non-2xx becomes "CODE: msg".
+pub(crate) async fn get_raw(
+    rs: &RemoteState,
+    addr: SocketAddr,
+    path: &str,
+    auth: (&str, &str),
+    timeout: Duration,
+) -> Result<(String, Vec<u8>), String> {
+    let url = format!("http://{}:{}{path}", url_host(addr.ip()), addr.port());
+    let resp = rs
+        .http
+        .get(&url)
+        .timeout(timeout)
+        .header("X-Tide-Id", auth.0)
+        .header("Authorization", format!("Bearer {}", auth.1))
+        .send()
+        .await
+        .map_err(|e| format!("UNREACHABLE: {e}"))?;
+    let status = resp.status().as_u16();
+    let ctype = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let body = resp.bytes().await.map_err(|e| format!("UNREACHABLE: {e}"))?.to_vec();
+    if (200..300).contains(&status) {
+        Ok((ctype, body))
+    } else {
+        answer(status, &body).map(|_| (ctype, Vec::new()))
+    }
+}
+
+pub(crate) async fn get_json(
+    rs: &RemoteState,
+    addr: SocketAddr,
+    path: &str,
+    auth: (&str, &str),
+    timeout: Duration,
+) -> Result<serde_json::Value, String> {
+    let (_, body) = get_raw(rs, addr, path, auth, timeout).await?;
+    serde_json::from_slice(&body).map_err(|e| format!("REMOTE_ERROR: bad answer: {e}"))
+}
+
+/// Quick reachability of a paired device (saved host, then last IP; no Bonjour).
+pub(crate) async fn quick_addr(dev: &Device, ms: u64) -> Option<SocketAddr> {
+    for h in std::iter::once(dev.host.clone()).chain(dev.last_ip.clone()) {
+        if let Some(a) = resolve(&h, dev.port).await {
+            if tcp_ok(a, ms).await {
+                return Some(a);
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -860,7 +1102,7 @@ async fn client_pair_finish(rs: &RemoteState, host: &str, addr: SocketAddr, code
 
 /// Find a working address for a paired device: saved host, last-known IP, then a
 /// Bonjour re-resolve by id (hotspot IPs change between sessions).
-async fn reach(rs: &RemoteState, dev: &Device) -> Result<SocketAddr, String> {
+pub(crate) async fn reach(rs: &RemoteState, dev: &Device) -> Result<SocketAddr, String> {
     let mut tried = HashSet::new();
     let mut cands: Vec<(String, u16)> = vec![(dev.host.clone(), dev.port)];
     if let Some(ip) = &dev.last_ip {
@@ -1049,6 +1291,15 @@ async fn start_server(rs: &Arc<RemoteState>, be: Arc<dyn Backend>) -> Result<u16
     Ok(port)
 }
 
+/// Serve on an already bound listener (tests: in-process servers on loopback).
+#[cfg(test)]
+pub(crate) fn serve_on(listener: TcpListener, rs: Arc<RemoteState>, be: Arc<dyn Backend>) {
+    if let Ok(a) = listener.local_addr() {
+        rs.port.store(a.port(), Ordering::SeqCst);
+    }
+    tokio::spawn(serve(listener, Arc::new(Ctx { rs, be })));
+}
+
 async fn stop_server(rs: &RemoteState) {
     if let Some(mut r) = rs.running.lock().await.take() {
         r.task.abort();
@@ -1144,7 +1395,9 @@ impl AppBackend {
         Ok(())
     }
 
-    async fn play_builtin(&self, req: PlayRequest) -> Result<(), String> {
+    /// Load `req` (a LAN URL) into the builtin player through the loopback relay.
+    /// `media` is what resume/watched are keyed by.
+    async fn play_builtin(&self, req: PlayRequest, media: MediaRef, fullscreen: bool) -> Result<PlayResult, String> {
         let port = self.rs.port().ok_or("REMOTE_DISABLED: remote play is off")?;
         let last = req.url.rsplit('/').next().unwrap_or("media").to_string();
         let rid = self.rs.add_relay(req.url.clone());
@@ -1159,8 +1412,7 @@ impl AppBackend {
         let result = PlayResult {
             mode: PlayMode::Builtin,
             title: req.title.clone(),
-            // Not a local torrent: the player skips resume/watched/next-episode.
-            media: MediaRef::Yt { id: "remote".into() },
+            media,
             stream_url,
             default_subtitle_id: subtitles.first().map(|t| t.id.clone()),
             subtitles,
@@ -1171,7 +1423,9 @@ impl AppBackend {
             let _ = w.set_title(&result.title);
             let _ = w.unminimize();
             let _ = w.show();
-            let _ = w.set_fullscreen(true);
+            if fullscreen {
+                let _ = w.set_fullscreen(true);
+            }
             let _ = w.set_focus();
             app.emit_to("player", "player-load", &result).map_err(internal)?;
         } else {
@@ -1181,13 +1435,84 @@ impl AppBackend {
                 .min_inner_size(320., 180.)
                 .background_color(tauri::window::Color(0, 0, 0, 255))
                 .theme(Some(tauri::Theme::Dark))
-                .fullscreen(true)
+                .fullscreen(fullscreen)
                 .build()
                 .map_err(internal)?;
             let _ = w.set_focus();
         }
-        Ok(())
+        Ok(result)
     }
+}
+
+/// Title + subtitle files (default first) of a media file of this Mac.
+fn stream_info_for(st: &AppState, key: &str, idx: usize) -> Result<StreamInfo, String> {
+    let files = engine::files(st, key)?;
+    let row = files.iter().find(|f| f.index == idx).cloned().ok_or("NOT_FOUND: no such file")?;
+    if !matches!(row.kind, FileKind::Video | FileKind::Audio) {
+        return Err("INVALID_INPUT: not a media file".into());
+    }
+    let (tracks, default_id) = if row.kind == FileKind::Video {
+        let videos: Vec<&str> = files.iter().filter(|f| f.kind == FileKind::Video).map(|f| f.name.as_str()).collect();
+        let subs: Vec<(usize, &str)> =
+            files.iter().filter(|f| f.kind == FileKind::Subtitle).map(|f| (f.index, f.name.as_str())).collect();
+        crate::subtitles::build_tracks(key, &row.name, &videos, &subs)
+    } else {
+        (Vec::new(), None)
+    };
+    let mut subs: Vec<(usize, &SubtitleTrack)> = tracks
+        .iter()
+        .filter_map(|t| crate::subtitles::parse_track_id(&t.id).map(|(_, i)| (i, t)))
+        .collect();
+    if let Some(d) = &default_id {
+        if let Some(pos) = subs.iter().position(|(_, t)| &t.id == d) {
+            let s = subs.remove(pos);
+            subs.insert(0, s);
+        }
+    }
+    Ok(StreamInfo {
+        title: row.name.rsplit('/').next().unwrap_or(&row.name).to_string(),
+        subs: subs.into_iter().map(|(i, t)| (i, t.label.clone(), t.lang.clone())).collect(),
+        playable_builtin: row.playable_builtin,
+    })
+}
+
+/// Decode a `data:<mime>;base64,<…>` URL.
+fn decode_data_url(url: &str) -> Option<(Vec<u8>, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (mime, b64) = rest.split_once(";base64,")?;
+    Some((base64_decode(b64)?, mime.to_string()))
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        } as u32)
+    };
+    let clean: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace() && *b != b'=').collect();
+    let mut out = Vec::with_capacity(clean.len() * 3 / 4);
+    for chunk in clean.chunks(4) {
+        if chunk.len() == 1 {
+            return None;
+        }
+        let mut n = 0u32;
+        for (i, c) in chunk.iter().enumerate() {
+            n |= val(*c)? << (18 - 6 * i);
+        }
+        out.push((n >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((n >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
 }
 
 impl Backend for AppBackend {
@@ -1237,7 +1562,8 @@ impl Backend for AppBackend {
         Box::pin(async move {
             match choose_mode(&req.url, req.mode_hint.as_deref(), crate::player::find_vlc().is_some())? {
                 Mode::Vlc => self.play_vlc(req).await,
-                Mode::Builtin => self.play_builtin(req).await,
+                // Not a local torrent: the player skips resume/watched/next-episode.
+                Mode::Builtin => self.play_builtin(req, MediaRef::Yt { id: "remote".into() }, true).await.map(|_| ()),
             }
         })
     }
@@ -1253,6 +1579,47 @@ impl Backend for AppBackend {
         if let Err(e) = self.app.emit(event, payload) {
             tracing::debug!("emit {event}: {e}");
         }
+    }
+
+    fn library(&self) -> BoxFut<'_, Result<Library, String>> {
+        Box::pin(async move {
+            let mut lib = Library::default();
+            for r in engine::list_rows(&self.st) {
+                if r.state == crate::types::TorrentState::Resolving {
+                    continue;
+                }
+                if let Ok(files) = engine::files(&self.st, &r.key) {
+                    let media: Vec<_> = files.into_iter().filter(|f| matches!(f.kind, FileKind::Video | FileKind::Audio)).collect();
+                    lib.files.insert(r.key.clone(), media);
+                }
+                if let Some(info) = crate::metadata::offline_info(&self.st, &r.key) {
+                    lib.media.insert(r.key.clone(), info);
+                }
+                lib.rows.push(r);
+            }
+            Ok(lib)
+        })
+    }
+
+    fn art(&self, key: String, kind: String) -> BoxFut<'_, Result<(Vec<u8>, String), String>> {
+        Box::pin(async move {
+            let url = crate::metadata::get_media_image(self.app.state::<Arc<AppState>>(), key, kind).await?;
+            decode_data_url(&url).ok_or_else(|| "NOT_FOUND: bad image".to_string())
+        })
+    }
+
+    fn stream_info(&self, key: String, idx: usize) -> BoxFut<'_, Result<StreamInfo, String>> {
+        Box::pin(async move { stream_info_for(&self.st, &key, idx) })
+    }
+
+    fn sync_state(&self, from: &str, since: u64) -> Result<serde_json::Value, String> {
+        let hub = self.app.state::<Arc<crate::sync::SyncHub>>();
+        hub.serve_state(from, since)
+    }
+
+    fn sync_push(&self, from: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
+        let hub = self.app.state::<Arc<crate::sync::SyncHub>>();
+        hub.serve_push(from, body)
     }
 }
 
@@ -1408,51 +1775,157 @@ pub async fn remote_play(rs: Rs<'_>, st: St<'_>, device_id: String, media: Media
     }
     let my_port = rs.port().ok_or("REMOTE_DISABLED: turn on Remote play")?;
     let dev = rs.device(&device_id).ok_or("NOT_FOUND: device is not paired")?;
-    let files = engine::files(&st, &key)?;
-    let row = files.iter().find(|f| f.index == file_index).cloned().ok_or("NOT_FOUND: no such file")?;
-    if !matches!(row.kind, FileKind::Video | FileKind::Audio) {
-        return Err("INVALID_INPUT: not a media file".into());
-    }
     let target = reach(&rs, &dev).await?;
     let ip = local_ip_for(target).ok_or("UNREACHABLE: no route to device")?;
-
-    let (tracks, default_id) = if row.kind == FileKind::Video {
-        let videos: Vec<&str> = files.iter().filter(|f| f.kind == FileKind::Video).map(|f| f.name.as_str()).collect();
-        let subs: Vec<(usize, &str)> =
-            files.iter().filter(|f| f.kind == FileKind::Subtitle).map(|f| (f.index, f.name.as_str())).collect();
-        crate::subtitles::build_tracks(&key, &row.name, &videos, &subs)
-    } else {
-        (Vec::new(), None)
-    };
-    let mut subs: Vec<(usize, &SubtitleTrack)> = tracks
-        .iter()
-        .filter_map(|t| crate::subtitles::parse_track_id(&t.id).map(|(_, i)| (i, t)))
-        .collect();
-    if let Some(d) = &default_id {
-        if let Some(pos) = subs.iter().position(|(_, t)| &t.id == d) {
-            let s = subs.remove(pos);
-            subs.insert(0, s);
-        }
-    }
-    let token = rs.grant(&key, file_index, subs.iter().map(|(i, _)| *i));
+    let info = stream_info_for(&st, &key, file_index)?;
     let base = format!("http://{}:{my_port}", url_host(ip));
-    let title = row.name.rsplit('/').next().unwrap_or(&row.name).to_string();
-    let req = PlayRequest {
-        url: format!("{base}/v1/stream/{token}/{key}/{file_index}/{}", urlencoding::encode(&title)),
-        subtitles: subs
-            .iter()
-            .map(|(i, t)| RemoteSub {
-                label: t.label.clone(),
-                lang: t.lang.clone(),
-                url: format!("{base}/v1/sub/{token}/{key}/{i}.vtt"),
-            })
-            .collect(),
-        mode_hint: Some(if row.playable_builtin { "builtin" } else { "vlc" }.into()),
-        title,
-    };
+    let req = build_request(&rs, &base, &key, file_index, &info);
     let body = serde_json::to_value(&req).map_err(internal)?;
     post_json(&rs, target, "/v1/play", Some((&rs.self_id(), &dev.secret)), body, Duration::from_secs(60)).await?;
     Ok(())
+}
+
+// ------------------------------------------------------------------ library of other Macs
+
+async fn fetch_library(rs: &RemoteState, dev: &Device) -> Result<LibrarySnapshot, String> {
+    let addr = quick_addr(dev, 800).await.ok_or_else(|| format!("UNREACHABLE: {} is offline", dev.name))?;
+    let v = get_json(rs, addr, "/v1/library", (&rs.self_id(), &dev.secret), Duration::from_secs(20)).await?;
+    let name = v.get("device_name").and_then(|x| x.as_str()).map(clean_name).unwrap_or_else(|| dev.name.clone());
+    let lib: Library = serde_json::from_value(v).map_err(|e| format!("REMOTE_ERROR: bad library: {e}"))?;
+    Ok(LibrarySnapshot { name, lib })
+}
+
+/// Libraries of all paired devices: fresh from online ones, the cached snapshot (online
+/// false) from the others.
+pub(crate) async fn libraries(rs: &Arc<RemoteState>) -> Vec<RemoteLibrary> {
+    let devices = rs.devices();
+    let mut set = tokio::task::JoinSet::new();
+    for (i, d) in devices.iter().cloned().enumerate() {
+        let rs = rs.clone();
+        set.spawn(async move { (i, fetch_library(&rs, &d).await) });
+    }
+    let mut fresh: Vec<Option<Result<LibrarySnapshot, String>>> = vec![None; devices.len()];
+    while let Some(Ok((i, r))) = set.join_next().await {
+        fresh[i] = Some(r);
+    }
+    let mut cache = rs.library.lock().unwrap();
+    cache.retain(|id, _| devices.iter().any(|d| &d.id == id));
+    devices
+        .iter()
+        .zip(fresh)
+        .map(|(d, r)| {
+            let online = match r {
+                Some(Ok(snap)) => {
+                    cache.insert(d.id.clone(), snap);
+                    true
+                }
+                Some(Err(e)) => {
+                    tracing::debug!("library of {}: {e}", d.name);
+                    false
+                }
+                None => false,
+            };
+            let snap = cache.get(&d.id).cloned().unwrap_or(LibrarySnapshot { name: d.name.clone(), lib: Library::default() });
+            RemoteLibrary {
+                device_id: d.id.clone(),
+                device_name: snap.name,
+                online,
+                rows: snap.lib.rows,
+                media: snap.lib.media,
+                files: snap.lib.files,
+            }
+        })
+        .collect()
+}
+
+/// Ask `dev` for a tokenized stream of one of its files.
+pub(crate) async fn stream_token(rs: &RemoteState, dev: &Device, addr: SocketAddr, key: &str, idx: usize) -> Result<PlayRequest, String> {
+    let body = json!({ "key": key, "fileIndex": idx });
+    let v = post_json(rs, addr, "/v1/stream-token", Some((&rs.self_id(), &dev.secret)), body, Duration::from_secs(20)).await?;
+    let pr: PlayRequest = serde_json::from_value(v).map_err(|e| format!("REMOTE_ERROR: bad answer: {e}"))?;
+    // The URLs must point back at the device we asked.
+    if !url_from_peer(&pr.url, addr.ip().to_canonical()) || !pr.subtitles.iter().all(|s| url_from_peer(&s.url, addr.ip().to_canonical())) {
+        return Err("REMOTE_ERROR: stream URL does not point at the device".into());
+    }
+    Ok(pr)
+}
+
+/// `remote_library` → `[{device_id, device_name, online, rows, media, files}]`.
+#[tauri::command]
+pub async fn remote_library(rs: Rs<'_>) -> Result<Vec<RemoteLibrary>, String> {
+    Ok(libraries(rs.inner()).await)
+}
+
+/// JS: `{ deviceId, key, fileIndex }`. Plays a file that lives on the paired device in
+/// THIS Mac's player (through the loopback relay) or VLC. Resume/watched stay keyed by
+/// `(key, fileIndex)`.
+#[tauri::command]
+pub async fn remote_play_local(
+    app: AppHandle,
+    rs: Rs<'_>,
+    st: St<'_>,
+    device_id: String,
+    key: String,
+    file_index: usize,
+) -> Result<PlayResult, String> {
+    let rs: Arc<RemoteState> = rs.inner().clone();
+    let key = key.to_ascii_lowercase();
+    if !is_hex(&key, 40) {
+        return Err("INVALID_INPUT: bad torrent key".into());
+    }
+    let dev = rs.device(&device_id).ok_or("NOT_FOUND: device is not paired")?;
+    let addr = reach(&rs, &dev).await?;
+    let pr = stream_token(&rs, &dev, addr, &key, file_index).await?;
+    let media = MediaRef::Torrent { key: key.clone(), file_index };
+    let be = AppBackend { app, st: st.inner().clone(), rs: rs.clone() };
+    match choose_mode(&pr.url, pr.mode_hint.as_deref(), crate::player::find_vlc().is_some())? {
+        Mode::Builtin => {
+            if rs.port().is_none() {
+                return Err("REMOTE_DISABLED: turn on Remote play (needed to relay the stream)".into());
+            }
+            be.play_builtin(pr, media, false).await
+        }
+        Mode::Vlc => {
+            let result = PlayResult {
+                mode: PlayMode::Vlc,
+                title: pr.title.clone(),
+                media,
+                stream_url: pr.url.clone(),
+                subtitles: Vec::new(),
+                default_subtitle_id: None,
+            };
+            be.play_vlc(pr).await?;
+            Ok(result)
+        }
+    }
+}
+
+/// JS: `{ deviceId, key, kind }` ("poster" | "backdrop") → data URL.
+#[tauri::command]
+pub async fn remote_art(rs: Rs<'_>, device_id: String, key: String, kind: String) -> Result<String, String> {
+    let key = key.to_ascii_lowercase();
+    if !is_hex(&key, 40) || !matches!(kind.as_str(), "poster" | "backdrop") {
+        return Err("INVALID_INPUT: bad key or kind".into());
+    }
+    let ck = (device_id.clone(), key.clone(), kind.clone());
+    if let Some(hit) = rs.art.lock().unwrap().iter().find(|(k, _)| *k == ck).map(|(_, v)| v.clone()) {
+        return Ok(hit);
+    }
+    let dev = rs.device(&device_id).ok_or("NOT_FOUND: device is not paired")?;
+    let addr = quick_addr(&dev, 800).await.ok_or_else(|| format!("UNREACHABLE: {} is offline", dev.name))?;
+    let (ctype, bytes) =
+        get_raw(&rs, addr, &format!("/v1/art/{key}/{kind}"), (&rs.self_id(), &dev.secret), Duration::from_secs(15)).await?;
+    let mime = ctype.split(';').next().unwrap_or("").trim();
+    if !mime.starts_with("image/") {
+        return Err("NOT_FOUND: not an image".into());
+    }
+    let url = format!("data:{mime};base64,{}", crate::artwork::base64(&bytes));
+    let mut c = rs.art.lock().unwrap();
+    c.push((ck, url.clone()));
+    if c.len() > ART_CACHE {
+        c.remove(0);
+    }
+    Ok(url)
 }
 
 // ------------------------------------------------------------------ tests
@@ -1488,6 +1961,30 @@ mod tests {
         }
         fn emit(&self, event: &str, payload: serde_json::Value) {
             self.events.lock().unwrap().push((event.to_string(), payload));
+        }
+        fn library(&self) -> BoxFut<'_, Result<Library, String>> {
+            Box::pin(async move {
+                let row: crate::types::TorrentRow = serde_json::from_value(json!({
+                    "key": KEY, "id": 0, "name": "Movie", "state": "completed", "error": null,
+                    "total_bytes": 1000, "progress_bytes": 1000, "progress": 1.0, "uploaded_bytes": 0,
+                    "down_bps": 0.0, "up_bps": 0.0, "peers": 0, "eta_secs": null, "output_path": "/x"
+                }))
+                .unwrap();
+                let mut lib = Library { rows: vec![row], ..Default::default() };
+                lib.media.insert(KEY.into(), crate::types::MediaInfo { title: "Movie".into(), ..Default::default() });
+                Ok(lib)
+            })
+        }
+        fn art(&self, _key: String, kind: String) -> BoxFut<'_, Result<(Vec<u8>, String), String>> {
+            Box::pin(async move { Ok((kind.into_bytes(), "image/jpeg".to_string())) })
+        }
+        fn stream_info(&self, key: String, idx: usize) -> BoxFut<'_, Result<StreamInfo, String>> {
+            Box::pin(async move {
+                if key != KEY || idx != 3 {
+                    return Err("NOT_FOUND: no such file".into());
+                }
+                Ok(StreamInfo { title: "Movie One.mp4".into(), subs: vec![(5, "English".into(), Some("en".into()))], playable_builtin: true })
+            })
         }
     }
 
@@ -1705,6 +2202,76 @@ mod tests {
             .await
             .is_err());
         assert_eq!(mock.played.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn library_endpoint_auth() {
+        let (recv, _mock, addr) = server("lib").await;
+        let sender = RemoteState::load(&tmpdir("lib-s"), "S".into());
+        let secret = "d".repeat(64);
+        pair_by_hand(&recv, &sender.self_id(), &secret);
+        let me = sender.self_id();
+        assert_eq!(get(addr, "/v1/library", None).await.0, 401);
+        assert_eq!(get(addr, &format!("/v1/art/{KEY}/poster"), None).await.0, 401);
+        let e = get_json(&sender, addr, "/v1/library", (&me, &"e".repeat(64)), Duration::from_secs(5)).await.unwrap_err();
+        assert!(e.starts_with("UNAUTHORIZED"), "{e}");
+        let e = get_json(&sender, addr, "/v1/sync/state?since=0", (&me, &secret), Duration::from_secs(5)).await.unwrap_err();
+        assert!(e.starts_with("REMOTE_ERROR"), "mock has no sync: {e}");
+
+        let v = get_json(&sender, addr, "/v1/library", (&me, &secret), Duration::from_secs(5)).await.unwrap();
+        assert_eq!(v["device_id"], json!(recv.self_id()));
+        let lib: Library = serde_json::from_value(v).unwrap();
+        assert_eq!(lib.rows[0].key, KEY);
+        assert_eq!(lib.media[KEY].title, "Movie");
+
+        let (ct, b) = get_raw(&sender, addr, &format!("/v1/art/{KEY}/backdrop"), (&me, &secret), Duration::from_secs(5)).await.unwrap();
+        assert_eq!((ct.as_str(), b.as_slice()), ("image/jpeg", b"backdrop".as_slice()));
+        assert!(get_raw(&sender, addr, &format!("/v1/art/{KEY}/evil"), (&me, &secret), Duration::from_secs(5)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn stream_token_flow() {
+        let (recv, mock, addr) = server("tok").await;
+        let sender = RemoteState::load(&tmpdir("tok-s"), "S".into());
+        let secret = "f".repeat(64);
+        pair_by_hand(&recv, &sender.self_id(), &secret);
+        let dev = Device {
+            id: recv.self_id(),
+            name: "Recv".into(),
+            host: "127.0.0.1".into(),
+            port: addr.port(),
+            secret: secret.clone(),
+            last_ip: None,
+        };
+        // Wrong secret / unknown file refused.
+        let bad = Device { secret: "0".repeat(64), ..dev.clone() };
+        assert!(stream_token(&sender, &bad, addr, KEY, 3).await.unwrap_err().starts_with("UNAUTHORIZED"));
+        assert!(stream_token(&sender, &dev, addr, KEY, 4).await.unwrap_err().starts_with("NOT_FOUND"));
+
+        let pr = stream_token(&sender, &dev, addr, KEY, 3).await.unwrap();
+        assert_eq!(pr.title, "Movie One.mp4");
+        assert_eq!(pr.mode_hint.as_deref(), Some("builtin"));
+        assert!(pr.url.starts_with(&format!("http://127.0.0.1:{}/v1/stream/", addr.port())), "{}", pr.url);
+        assert!(pr.url.ends_with("/Movie%20One.mp4"));
+        assert_eq!(pr.subtitles.len(), 1);
+
+        // The tokenized URLs work (via a plain GET, as WebKit/VLC would), nothing else.
+        let path = pr.url.split_once(&format!(":{}", addr.port())).unwrap().1.to_string();
+        let (c, _, b) = get(addr, &path, Some("bytes=0-9")).await;
+        assert_eq!((c, b.len()), (206, 10));
+        let sub = pr.subtitles[0].url.split_once(&format!(":{}", addr.port())).unwrap().1.to_string();
+        assert_eq!(get(addr, &sub, None).await.2, b"WEBVTT\n\n5".to_vec());
+        assert_eq!(get(addr, &path.replace(&format!("/{KEY}/3/"), &format!("/{KEY}/4/")), None).await.0, 401);
+        assert_eq!(mock.opened.lock().unwrap().as_slice(), &[(KEY.to_string(), 3)]);
+    }
+
+    #[test]
+    fn data_urls() {
+        let bytes: Vec<u8> = (0..=255u8).collect();
+        let url = format!("data:image/png;base64,{}", crate::artwork::base64(&bytes));
+        assert_eq!(decode_data_url(&url), Some((bytes, "image/png".into())));
+        assert_eq!(base64_decode("aGk="), Some(b"hi".to_vec()));
+        assert!(decode_data_url("data:image/png,xx").is_none());
     }
 
     #[test]

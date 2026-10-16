@@ -1,29 +1,78 @@
 //! Persistence for manual groups (`groups.json`) and watched flags (`watched.json`).
 //! Grouping itself is computed in the frontend; this module only stores the data.
+//!
+//! Mac↔Mac sync (see sync.rs): every group carries `updated_at` (unix ms) and deletes
+//! stay as tombstones (`deleted`); excluded keys carry `excluded_at`; watched entries are
+//! `{watched, updated_at, device}` (legacy `{"k": true}` still loads). Merge is last
+//! writer wins per entry. Stores are keyed by data dir (tests run several at once).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::types::{Group, GroupsFile};
 
+/// What `get_watched` returns: only watched entries, `"key:idx" -> true`.
 pub type Watched = BTreeMap<String, bool>;
 
-struct Store {
-    dir: PathBuf,
-    groups: GroupsFile,
-    watched: Watched,
+/// One watched mark (false = tombstone of an unmark).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WatchedEntry {
+    pub watched: bool,
+    #[serde(default)]
+    pub updated_at: u64,
+    #[serde(default)]
+    pub device: String,
 }
 
-static STORE: Mutex<Option<Store>> = Mutex::new(None);
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WatchedVal {
+    Legacy(bool),
+    Entry(WatchedEntry),
+}
+
+pub type WatchedFile = BTreeMap<String, WatchedEntry>;
+
+fn parse_watched(bytes: &[u8]) -> Result<WatchedFile, serde_json::Error> {
+    let raw: BTreeMap<String, WatchedVal> = serde_json::from_slice(bytes)?;
+    Ok(raw
+        .into_iter()
+        .map(|(k, v)| {
+            let e = match v {
+                WatchedVal::Legacy(b) => WatchedEntry { watched: b, updated_at: 0, device: String::new() },
+                WatchedVal::Entry(e) => e,
+            };
+            (k, e)
+        })
+        .collect())
+}
+
+/// Exclusion state of one key for sync.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExcludedEntry {
+    pub excluded: bool,
+    pub updated_at: u64,
+}
+
+struct Store {
+    groups: GroupsFile,
+    watched: WatchedFile,
+}
+
+static STORES: Mutex<Option<HashMap<PathBuf, Store>>> = Mutex::new(None);
 
 /// Same directory `state.rs` uses.
 fn data_dir() -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME").ok_or("HOME not set")?;
     Ok(PathBuf::from(home).join("Library/Application Support/com.musahinist.tide"))
+}
+
+pub fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 fn load<T: DeserializeOwned + Default>(path: &Path) -> T {
@@ -33,6 +82,16 @@ fn load<T: DeserializeOwned + Default>(path: &Path) -> T {
             T::default()
         }),
         Err(_) => T::default(),
+    }
+}
+
+fn load_watched(path: &Path) -> WatchedFile {
+    match std::fs::read(path) {
+        Ok(bytes) => parse_watched(&bytes).unwrap_or_else(|e| {
+            tracing::warn!("{}: invalid JSON, starting empty: {e}", path.display());
+            WatchedFile::default()
+        }),
+        Err(_) => WatchedFile::default(),
     }
 }
 
@@ -47,28 +106,58 @@ fn save<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))
 }
 
+fn with_store_in<R>(dir: &Path, f: impl FnOnce(&mut Store) -> Result<R, String>) -> Result<R, String> {
+    let mut guard = STORES.lock().map_err(|_| "groups store poisoned".to_string())?;
+    let map = guard.get_or_insert_with(HashMap::new);
+    let s = map.entry(dir.to_path_buf()).or_insert_with(|| Store {
+        groups: load(&dir.join("groups.json")),
+        watched: load_watched(&dir.join("watched.json")),
+    });
+    f(s)
+}
+
 fn with_store<R>(f: impl FnOnce(&mut Store) -> Result<R, String>) -> Result<R, String> {
-    let mut guard = STORE.lock().map_err(|_| "groups store poisoned".to_string())?;
-    if guard.is_none() {
-        let dir = data_dir()?;
-        *guard = Some(Store {
-            groups: load(&dir.join("groups.json")),
-            watched: load(&dir.join("watched.json")),
-            dir,
-        });
+    with_store_in(&data_dir()?, f)
+}
+
+/// Stamp what a local mutation changed: edited groups get `updated_at`, removed ones
+/// become tombstones, exclusion flips get `excluded_at`.
+fn stamp_changes(old: &GroupsFile, next: &mut GroupsFile, now: u64) {
+    let strip = |g: &Group| Group { updated_at: 0, ..g.clone() };
+    for g in &mut next.groups {
+        match old.groups.iter().find(|o| o.id == g.id) {
+            Some(o) if strip(o) == strip(g) => {}
+            _ => g.updated_at = now,
+        }
     }
-    f(guard.as_mut().expect("store initialised"))
+    for o in &old.groups {
+        if !next.groups.iter().any(|g| g.id == o.id) {
+            next.groups.push(Group { id: o.id.clone(), name: o.name.clone(), deleted: true, updated_at: now, ..Default::default() });
+        }
+    }
+    let keys: std::collections::BTreeSet<String> = old.excluded.keys().chain(next.excluded.keys()).cloned().collect();
+    for k in keys {
+        if old.excluded.contains_key(&k) != next.excluded.contains_key(&k) {
+            next.excluded_at.insert(k, now);
+        }
+    }
 }
 
 /// Apply a mutation to the groups file and persist it.
 fn mutate_groups<R>(f: impl FnOnce(&mut GroupsFile) -> Result<R, String>) -> Result<R, String> {
-    with_store(|s| {
-        let mut next = s.groups.clone();
-        let out = f(&mut next)?;
-        save(&s.dir.join("groups.json"), &next)?;
-        s.groups = next;
-        Ok(out)
-    })
+    let dir = data_dir()?;
+    let out = with_store_in(&dir, |s| mutate_groups_store(s, &dir, f))?;
+    crate::sync::touch();
+    Ok(out)
+}
+
+fn mutate_groups_store<R>(s: &mut Store, dir: &Path, f: impl FnOnce(&mut GroupsFile) -> Result<R, String>) -> Result<R, String> {
+    let mut next = s.groups.clone();
+    let out = f(&mut next)?;
+    stamp_changes(&s.groups, &mut next, now_ms());
+    save(&dir.join("groups.json"), &next)?;
+    s.groups = next;
+    Ok(out)
 }
 
 fn new_id() -> String {
@@ -92,7 +181,7 @@ fn detach(g: &mut GroupsFile, key: &str) {
 fn find<'a>(g: &'a mut GroupsFile, id: &str) -> Result<&'a mut Group, String> {
     g.groups
         .iter_mut()
-        .find(|x| x.id == id)
+        .find(|x| x.id == id && !x.deleted)
         .ok_or_else(|| format!("no group {id}"))
 }
 
@@ -105,7 +194,7 @@ fn op_create(g: &mut GroupsFile, id: String, name: String, keys: Vec<String>) ->
             members.push(key);
         }
     }
-    let group = Group { id, name, members, auto_key: None };
+    let group = Group { id, name, members, ..Default::default() };
     g.groups.push(group.clone());
     group
 }
@@ -140,7 +229,16 @@ fn watched_key(key: &str, file_index: usize) -> String {
 
 #[tauri::command]
 pub fn list_groups() -> Result<GroupsFile, String> {
-    with_store(|s| Ok(s.groups.clone()))
+    with_store(|s| Ok(visible_groups(&s.groups)))
+}
+
+/// `groups.json` without sync bookkeeping (tombstones, timestamps).
+fn visible_groups(g: &GroupsFile) -> GroupsFile {
+    GroupsFile {
+        groups: g.groups.iter().filter(|x| !x.deleted).map(|x| Group { updated_at: 0, ..x.clone() }).collect(),
+        excluded: g.excluded.clone(),
+        excluded_at: BTreeMap::new(),
+    }
 }
 
 #[tauri::command]
@@ -174,25 +272,193 @@ pub fn delete_group(id: String) -> Result<(), String> {
     })
 }
 
+fn visible_watched(w: &WatchedFile) -> Watched {
+    w.iter().filter(|(_, e)| e.watched).map(|(k, _)| (k.clone(), true)).collect()
+}
+
 #[tauri::command]
 pub fn get_watched() -> Result<Watched, String> {
-    with_store(|s| Ok(s.watched.clone()))
+    with_store(|s| Ok(visible_watched(&s.watched)))
+}
+
+fn set_watched_in(dir: &Path, key: &str, file_index: usize, watched: bool, device: &str) -> Result<(), String> {
+    with_store_in(dir, |s| {
+        let mut next = s.watched.clone();
+        let k = watched_key(key, file_index);
+        if next.get(&k).map(|e| e.watched) == Some(watched) || (!watched && !next.contains_key(&k)) {
+            return Ok(());
+        }
+        next.insert(k, WatchedEntry { watched, updated_at: now_ms(), device: device.to_string() });
+        save(&dir.join("watched.json"), &next)?;
+        s.watched = next;
+        Ok(())
+    })
 }
 
 #[tauri::command]
 pub fn set_watched(key: String, file_index: usize, watched: bool) -> Result<(), String> {
-    with_store(|s| {
-        let mut next = s.watched.clone();
-        let k = watched_key(&key, file_index);
-        if watched {
-            next.insert(k, true);
-        } else {
-            next.remove(&k);
-        }
-        save(&s.dir.join("watched.json"), &next)?;
-        s.watched = next;
-        Ok(())
+    set_watched_in(&data_dir()?, &key, file_index, watched, &crate::sync::device_id())?;
+    crate::sync::touch();
+    Ok(())
+}
+
+// ---- sync (sync.rs) ----
+
+/// Is `b` (ts, device) newer than `a`? Ties go to the larger device id so both Macs
+/// converge on the same winner.
+pub fn newer(a: (u64, &str), b: (u64, &str)) -> bool {
+    b.0 > a.0 || (b.0 == a.0 && b.1 > a.1)
+}
+
+fn since_ok(ts: u64, since: u64) -> bool {
+    since == 0 || ts > since
+}
+
+/// Entries changed after `since` (0 = everything).
+pub fn sync_export(dir: &Path, since: u64) -> Result<(WatchedFile, Vec<Group>, BTreeMap<String, ExcludedEntry>), String> {
+    with_store_in(dir, |s| {
+        let w = s.watched.iter().filter(|(_, e)| since_ok(e.updated_at, since)).map(|(k, e)| (k.clone(), e.clone())).collect();
+        let g = s.groups.groups.iter().filter(|g| since_ok(g.updated_at, since)).cloned().collect();
+        let x = s
+            .groups
+            .excluded_at
+            .iter()
+            .filter(|(_, ts)| since_ok(**ts, since))
+            .map(|(k, ts)| (k.clone(), ExcludedEntry { excluded: s.groups.excluded.contains_key(k), updated_at: *ts }))
+            .collect();
+        Ok((w, g, x))
     })
+}
+
+/// Pure LWW merge of watched entries; true if anything changed.
+pub fn merge_watched(local: &mut WatchedFile, remote: WatchedFile) -> bool {
+    let mut changed = false;
+    for (k, r) in remote {
+        let take = match local.get(&k) {
+            None => true,
+            Some(l) => newer((l.updated_at, &l.device), (r.updated_at, &r.device)),
+        };
+        if take && local.get(&k) != Some(&r) {
+            local.insert(k, r);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Pure LWW merge of groups (per group) and exclusions (per key); true if changed.
+pub fn merge_groups(local: &mut GroupsFile, groups: Vec<Group>, excluded: BTreeMap<String, ExcludedEntry>) -> bool {
+    let mut changed = false;
+    for r in groups {
+        if r.id.is_empty() {
+            continue;
+        }
+        match local.groups.iter_mut().find(|g| g.id == r.id) {
+            Some(l) => {
+                if r.updated_at > l.updated_at && *l != r {
+                    *l = r;
+                    changed = true;
+                }
+            }
+            None => {
+                local.groups.push(r);
+                changed = true;
+            }
+        }
+    }
+    for (k, r) in excluded {
+        let lt = local.excluded_at.get(&k).copied();
+        if lt.is_none_or(|t| r.updated_at > t) {
+            let was = local.excluded.contains_key(&k);
+            if r.excluded {
+                local.excluded.insert(k.clone(), true);
+            } else {
+                local.excluded.remove(&k);
+            }
+            local.excluded_at.insert(k, r.updated_at);
+            changed |= was != r.excluded || lt.is_none();
+        }
+    }
+    if changed {
+        normalize_members(local);
+    }
+    changed
+}
+
+/// A key belongs to at most one live group: the most recently changed one keeps it
+/// (deterministic, so both Macs end up identical without restamping).
+fn normalize_members(g: &mut GroupsFile) {
+    let mut owner: HashMap<String, (u64, String)> = HashMap::new();
+    for grp in g.groups.iter().filter(|x| !x.deleted) {
+        for k in &grp.members {
+            let cand = (grp.updated_at, grp.id.clone());
+            match owner.get(k) {
+                Some(cur) if *cur >= cand => {}
+                _ => {
+                    owner.insert(k.clone(), cand);
+                }
+            }
+        }
+    }
+    for grp in g.groups.iter_mut() {
+        if grp.deleted {
+            grp.members.clear();
+            continue;
+        }
+        let id = grp.id.clone();
+        grp.members.retain(|k| owner.get(k).is_some_and(|(_, o)| *o == id));
+    }
+}
+
+/// Merge remote entries into `dir`'s stores. Returns (watched changed, groups changed).
+pub fn sync_apply(
+    dir: &Path,
+    watched: WatchedFile,
+    groups: Vec<Group>,
+    excluded: BTreeMap<String, ExcludedEntry>,
+) -> Result<(bool, bool), String> {
+    with_store_in(dir, |s| {
+        let mut w = s.watched.clone();
+        let wc = merge_watched(&mut w, watched);
+        if wc {
+            save(&dir.join("watched.json"), &w)?;
+            s.watched = w;
+        }
+        let mut g = s.groups.clone();
+        let gc = merge_groups(&mut g, groups, excluded);
+        if gc {
+            save(&dir.join("groups.json"), &g)?;
+            s.groups = g;
+        }
+        Ok((wc, gc))
+    })
+}
+
+/// Visible groups / watched of a data dir (tests, sync).
+#[allow(dead_code)]
+pub fn snapshot_in(dir: &Path) -> Result<(GroupsFile, Watched), String> {
+    with_store_in(dir, |s| Ok((visible_groups(&s.groups), visible_watched(&s.watched))))
+}
+
+/// Local mutations against an explicit data dir (tests).
+#[cfg(test)]
+pub fn test_set_watched(dir: &Path, key: &str, idx: usize, watched: bool, device: &str) -> Result<(), String> {
+    set_watched_in(dir, key, idx, watched, device)
+}
+
+#[cfg(test)]
+pub fn test_mutate_groups<R>(dir: &Path, f: impl FnOnce(&mut GroupsFile) -> Result<R, String>) -> Result<R, String> {
+    with_store_in(dir, |s| mutate_groups_store(s, dir, f))
+}
+
+#[cfg(test)]
+pub fn test_create(g: &mut GroupsFile, id: &str, name: &str, keys: &[&str]) -> Group {
+    op_create(g, id.into(), name.into(), keys.iter().map(|k| k.to_string()).collect())
+}
+
+#[cfg(test)]
+pub fn test_delete(g: &mut GroupsFile, id: &str) {
+    op_delete(g, id)
 }
 
 #[cfg(test)]

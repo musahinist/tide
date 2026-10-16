@@ -15,6 +15,7 @@ mod remote;
 mod state;
 mod subfetch;
 mod subtitles;
+mod sync;
 mod types;
 mod watcher;
 mod ytdlp;
@@ -109,8 +110,12 @@ fn main() -> anyhow::Result<()> {
 
     macos::register_default_magnet_handler(BUNDLE_ID, &st.data_dir);
 
+    let remote_state = Arc::new(remote::RemoteState::load(&st.data_dir, remote::computer_name()));
+    sync::init_device(&remote_state.self_id());
+    let sync_hub = Arc::new(sync::SyncHub::new(&st.data_dir, remote_state.self_id(), sync::SettingsIo::App));
     let setup_state = st.clone();
     let si_state = st.clone();
+    let (setup_remote, setup_hub) = (remote_state.clone(), sync_hub.clone());
     tauri::Builder::default()
         // Must be first. A second launch hands argv to us and exits; on macOS the
         // deep-link plugin ignores forwarded argv, so magnets are handled here too.
@@ -120,7 +125,8 @@ fn main() -> anyhow::Result<()> {
         }))
         .plugin(tauri_plugin_deep_link::init())
         .manage(st.clone())
-        .manage(Arc::new(remote::RemoteState::load(&st.data_dir, remote::computer_name())))
+        .manage(remote_state)
+        .manage(sync_hub)
         .setup(move |app| {
             let handle = app.handle().clone();
 
@@ -148,6 +154,8 @@ fn main() -> anyhow::Result<()> {
 
             // "Play on another Mac" LAN server + Bonjour advert (if enabled).
             remote::spawn(handle.clone(), setup_state.clone());
+            // Mac↔Mac sync of watch state, groups and shared settings.
+            sync::spawn(handle.clone(), setup_hub.clone(), setup_remote.clone());
             // Mobile-data mode (path monitor + 1 s loop, "net-status" events).
             netmode::spawn_background(handle.clone(), setup_state.clone());
 
@@ -228,6 +236,15 @@ fn main() -> anyhow::Result<()> {
             remote::remote_pair_finish,
             remote::remote_unpair,
             remote::remote_play,
+            // Mac↔Mac sync
+            remote::remote_library,
+            remote::remote_play_local,
+            remote::remote_art,
+            sync::resume_get,
+            sync::resume_set,
+            sync::resume_list,
+            sync::sync_status,
+            sync::sync_now,
             // mobile-data mode, notifications, cleanup
             netmode::net_status,
             netmode::net_set_mode,

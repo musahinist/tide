@@ -630,3 +630,21 @@ body:not(.has-remote) .rbtn, [hidden] + .rbtn { display: none !important; }
 .prtitle { margin: 0 0 4px; color: #fff; font-weight: 600; font-size: 14px; }
 .prcard .whint { margin: 0; color: var(--muted); font-size: 11px; }
 .prcode { margin: 14px 0 16px; color: #fff; font-size: 34px; font-weight: 600; letter-spacing: .08em; font-variant-numeric: tabular-nums; }
+
+/* ---------- Mac↔Mac sync: items stored on another Mac ---------- */
+.devtag {
+  display: inline-block; margin: 0 7px 0 0; padding: 0 6px; border-radius: 4px; background: rgba(255, 255, 255, .08);
+  color: #aaa; font-size: 10.5px; font-weight: 500; line-height: 16px; vertical-align: 1px;
+}
+.devtag[hidden] { display: none; }
+.devtag.off { color: var(--faint); }
+/* dimmed slightly; filter (not opacity) so the art/thumb fade-in transitions keep working */
+.torrent.remote > .head > .name, .torrent.remote > .head > .stats, .torrent.remote > .head > .thumb,
+.torrent.remote > .head > .art, .torrent.remote > .head > .bar, .torrent.remote > .head > .wcheck { filter: opacity(.62); transition: filter .15s; }
+.torrent.remote > .head:hover > * { filter: none; }
+.ltile.remote .lpic { filter: brightness(.78) saturate(.8); transition: filter .15s, box-shadow .15s, transform .15s; }
+.ltile.remote:hover .lpic { filter: none; }
+.ltile.remote .lname { color: #bdbdbd; }
+.ldev { position: absolute; left: 6px; bottom: 8px; margin: 0; max-width: calc(100% - 12px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background: rgba(20, 20, 20, .78); color: #ccc; }
+.rsync { flex: none; color: var(--muted); font-size: 11px; }
+.rsync.bad { color: var(--err); }

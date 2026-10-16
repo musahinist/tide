@@ -59,6 +59,11 @@
     const m = current.media;
     return m.kind === 'torrent' ? `tide:resume:${m.key}:${m.fileIndex}` : null;
   }
+  // Torrent media of the current item ({key, fileIndex}) or null.
+  const resumeMedia = () => {
+    const m = current && current.media;
+    return m && m.kind === 'torrent' ? { key: m.key, fileIndex: m.fileIndex } : null;
+  };
 
   // Duration next to the resume position (main window's "Continue watching").
   const durKey = () => { const k = resumeKey(); return k ? k.replace('tide:resume:', 'tide:dur:') : null; };
@@ -67,11 +72,11 @@
     if (k && isFinite(d) && d > 0) lsSet(k, String(Math.round(d)));
   }
   function clearResume() {
-    const k = resumeKey(), dk = durKey();
+    const k = resumeKey(), dk = durKey(), rm = resumeMedia();
     if (k) lsDel(k);
     if (dk) lsDel(dk);
+    if (rm) backendSet(rm, 0, 0);
   }
-
   function lsGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
   function lsSet(k, v) { try { localStorage.setItem(k, v); } catch { /* ignore */ } }
   function lsDel(k) { try { localStorage.removeItem(k); } catch { /* ignore */ } }
@@ -96,25 +101,85 @@
   function hideMessage() { msg.hidden = true; }
 
   // ------------------------------------------------------------ resume
+  // Positions live in the backend (resume_get / resume_set, synced between Macs).
+  // localStorage stays as a mirror and as the fallback when those commands are missing.
 
+  let backendOk = null; // null = unknown, true / false once a call answered
+  const missingCmd = (e) => /^command \S+ not found|unknown command|NOT_IMPLEMENTED|not allowed/i.test(String(e && e.message ? e.message : e));
+  function backendFail(e) {
+    if (missingCmd(e)) backendOk = false;
+    else console.warn('resume backend', e);
+  }
+
+  function backendSet(rm, pos, dur) {
+    if (backendOk === false || !T) return Promise.resolve();
+    return invoke('resume_set', { key: rm.key, fileIndex: rm.fileIndex, pos: Math.floor(pos), dur: Math.round(dur || 0) })
+      .then(() => { backendOk = true; }, backendFail);
+  }
+
+  // Seconds to resume at for rm, or NaN. Backend first, localStorage as fallback.
+  async function readResume(rm, lsKey) {
+    const local = lsKey ? parseFloat(lsGet(lsKey)) : NaN;
+    if (backendOk === false || !T) return local;
+    try {
+      const r = await invoke('resume_get', { key: rm.key, fileIndex: rm.fileIndex });
+      backendOk = true;
+      if (r && isFinite(r.pos) && r.pos > 0) return r.pos;
+      return lsGet('tide:resume:migrated') ? NaN : local; // first run: migration may still be on its way
+    } catch (e) { backendFail(e); return local; }
+  }
+
+  // One-time copy of the old localStorage positions into the backend.
+  async function migrateResume() {
+    if (!T || lsGet('tide:resume:migrated')) return;
+    const re = /^tide:resume:([0-9a-f]{40}):(\d+)$/;
+    const todo = [];
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const m = re.exec(localStorage.key(i) || '');
+        if (!m) continue;
+        const pos = parseFloat(localStorage.getItem(m[0]));
+        if (!isFinite(pos) || pos <= 0) continue;
+        const dur = parseFloat(localStorage.getItem(`tide:dur:${m[1]}:${m[2]}`));
+        todo.push({ key: m[1], fileIndex: Number(m[2]), pos: Math.floor(pos), dur: isFinite(dur) ? Math.round(dur) : 0 });
+      }
+    } catch { return; }
+    for (const x of todo) {
+      try {
+        // Don't overwrite a newer position the backend already has (e.g. from the other Mac).
+        const have = await invoke('resume_get', { key: x.key, fileIndex: x.fileIndex });
+        if (!have || !(have.pos > 0)) await invoke('resume_set', x);
+      } catch (e) {
+        if (missingCmd(e)) { backendOk = false; return; } // retry on a later run
+        console.warn('resume migrate', e);
+      }
+    }
+    backendOk = true;
+    lsSet('tide:resume:migrated', '1');
+  }
+
+  const SAVE_EVERY_MS = 5000;
   let lastSave = 0;
   function savePosition(force) {
-    const k = resumeKey();
+    const k = resumeKey(), rm = resumeMedia();
     if (!k || !resumeApplied) return;
     const now = Date.now();
-    if (!force && now - lastSave < 3000) return;
+    if (!force && now - lastSave < SAVE_EVERY_MS) return;
     lastSave = now;
     const t = el.currentTime, d = el.duration;
     if (!isFinite(t) || t < 5) return;
     if (isFinite(d) && d > 0 && (t >= 0.9 * d || d - t <= 10)) { clearResume(); return; }
     lsSet(k, String(Math.floor(t)));
+    backendSet(rm, t, isFinite(d) ? d : 0);
   }
 
-  function applyResume() {
+  let resumeWanted = null; // Promise<seconds> fetched at load(), applied at loadedmetadata
+  async function applyResume() {
     if (resumeApplied) return;
+    const pr = current;
+    const saved = resumeWanted ? await resumeWanted : NaN;
+    if (current !== pr || resumeApplied) return;
     resumeApplied = true;
-    const k = resumeKey();
-    const saved = k ? parseFloat(lsGet(k)) : NaN;
     const d = el.duration;
     if (!isFinite(saved) || saved <= 0) return;
     // Resume only if < 90% watched and > 10 s remain.
@@ -438,6 +503,8 @@
     nextBtn.hidden = true;
 
     current = pr;
+    const rm = resumeMedia();
+    resumeWanted = rm ? readResume(rm, resumeKey()) : null;
     // Played from another Mac: the file lives there, so VLC here can't open it.
     vlcBtn.style.display = pr.media && pr.media.kind === 'yt' && pr.media.id === 'remote' ? 'none' : '';
     document.title = pr.title || 'Player';
@@ -564,6 +631,7 @@
 
   async function boot() {
     if (!T) { showMessage('Open this window from Tide.'); return; }
+    migrateResume().catch((e) => console.warn('resume migrate', e));
     try {
       await T.event.listen('player-load', (ev) => load(ev.payload));
     } catch (e) { console.warn('listen failed', e); }
