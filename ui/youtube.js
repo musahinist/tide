@@ -18,7 +18,9 @@
     stop: '<rect class="fill" x="4.5" y="4.5" width="7" height="7" rx="1"/>',
     remove: '<path d="M4 4l8 8M12 4l-8 8"/>',
     folder: '<path d="M2 4.5c0-.6.4-1 1-1h3.2l1.5 1.5H13c.6 0 1 .4 1 1v6c0 .6-.4 1-1 1H3c-.6 0-1-.4-1-1z"/>',
+    archive: '<rect x="2" y="9" width="12" height="4.5" rx="1"/><path d="M8 2.5v5M5.5 5l2.5 2.5L10.5 5"/>',
   };
+  const archiveTarget = () => (window.TideArchive && window.TideArchive.target()) || null;
   function iconBtn(name, title, onClick) {
     const b = h('button', 'icon');
     b.type = 'button';
@@ -250,7 +252,8 @@
     r.cancel = iconBtn('stop', 'Cancel download', () => invoke('yt_cancel', { id }).then(refresh, report));
     r.reveal = iconBtn('folder', 'Show in Finder', () => invoke('yt_reveal', { id }).catch(report));
     r.remove = iconBtn('remove', 'Remove', () => askRemove(r.last));
-    ctl.append(r.play, r.cancel, r.reveal, r.remove);
+    r.archive = iconBtn('archive', 'Move to archive Mac', () => window.TideArchive && window.TideArchive.move({ ytId: id }));
+    ctl.append(r.play, r.archive, r.cancel, r.reveal, r.remove);
     head.append(name, stats, ctl, bar);
     head.addEventListener('dblclick', () => { if (r.last && r.last.state === 'done') r.play.click(); });
     el.append(head);
@@ -268,6 +271,9 @@
     const w = `${((j.state === 'done' ? 1 : j.progress) * 100).toFixed(2)}%`;
     if (r.fill.style.width !== w) r.fill.style.width = w;
     r.play.hidden = j.state !== 'done';
+    const target = j.state === 'done' ? archiveTarget() : null;
+    r.archive.hidden = !target;
+    if (target) r.archive.title = `Move to ${target}`;
     r.cancel.hidden = !running(j.state);
     r.reveal.hidden = !j.file_path && j.state === 'queued';
     r.last = j;

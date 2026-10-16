@@ -219,6 +219,32 @@ pub fn owned_files(st: &AppState, key: &str) -> Vec<PathBuf> {
     load(&st.data_dir).owned.get(&key).map(|v| v.iter().map(|o| o.path.clone()).collect()).unwrap_or_default()
 }
 
+/// Tide-owned online subtitles of `key` as (path, file_index, lang, url) (archive move).
+pub fn owned_entries(st: &AppState, key: &str) -> Vec<(PathBuf, usize, String, String)> {
+    let key = key.trim().to_ascii_lowercase();
+    load(&st.data_dir)
+        .owned
+        .get(&key)
+        .map(|v| v.iter().map(|o| (o.path.clone(), o.file_index, o.lang.clone(), o.url.clone())).collect())
+        .unwrap_or_default()
+}
+
+/// Record subtitle files that arrived with an archived torrent as Tide-owned.
+pub fn adopt(data_dir: &Path, key: &str, entries: Vec<(PathBuf, usize, String, String)>) {
+    if entries.is_empty() {
+        return;
+    }
+    let key = key.trim().to_ascii_lowercase();
+    let mut s = load(data_dir);
+    let list = s.owned.entry(key).or_default();
+    for (path, file_index, lang, url) in entries {
+        if !list.iter().any(|o| o.path == path) {
+            list.push(Owned { path, file_index, lang, url });
+        }
+    }
+    save(data_dir, &s);
+}
+
 /// Drop `key` from the owned list (after its files were removed).
 pub fn forget(st: &AppState, key: &str) {
     let key = key.trim().to_ascii_lowercase();

@@ -718,6 +718,68 @@ pub fn yt_cancel(app: AppHandle, state: St<'_>, id: String) -> Result<(), String
 #[tauri::command]
 pub async fn yt_remove(app: AppHandle, state: St<'_>, id: String, delete_file: bool) -> Result<(), String> {
     let st: Arc<AppState> = state.inner().clone();
+    remove_job(&app, &st, &id, delete_file).await
+}
+
+/// Done jobs with their own folder (archive move candidates).
+pub(crate) fn done_jobs(st: &AppState) -> Vec<(YtJob, Option<PathBuf>)> {
+    ensure_loaded(st);
+    lock(st)
+        .jobs
+        .iter()
+        .filter(|j| j.info.state == YtJobState::Done && j.info.file_path.is_some())
+        .map(|j| (j.info.clone(), j.dir.clone()))
+        .collect()
+}
+
+/// Register a finished download that arrived from another Mac (archive move): a done
+/// job pointing at `file` inside `dir`. Returns its id.
+pub(crate) fn register_archived(
+    app: Option<&AppHandle>,
+    st: &Arc<AppState>,
+    url: &str,
+    title: &str,
+    thumbnail: Option<String>,
+    preset: YtPreset,
+    dir: PathBuf,
+    file: PathBuf,
+) -> String {
+    ensure_loaded(st);
+    let size = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+    let id = {
+        let mut g = lock(st);
+        g.next += 1;
+        let info = YtJob {
+            id: format!("yt-{}", g.next),
+            url: url.to_string(),
+            title: title.to_string(),
+            thumbnail,
+            preset,
+            state: YtJobState::Done,
+            progress: 1.0,
+            downloaded_bytes: size,
+            total_bytes: Some(size),
+            speed_bps: None,
+            eta_secs: None,
+            file_path: Some(file.to_string_lossy().into_owned()),
+            error: None,
+        };
+        let id = info.id.clone();
+        g.jobs.push(Job { info, dir: Some(dir), cancel: None, task: None });
+        id
+    };
+    save(st);
+    if let Some(app) = app {
+        touch(app, st);
+    }
+    id
+}
+
+/// `yt_remove` without the command wrapper.
+pub(crate) async fn remove_job(app: &AppHandle, st: &Arc<AppState>, id: &str, delete_file: bool) -> Result<(), String> {
+    let st = st.clone();
+    let id = id.to_string();
+    let app = app.clone();
     ensure_loaded(&st);
     let task = cancel_job(&st, &id)?;
     let removed = {

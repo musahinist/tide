@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod archive;
 mod artwork;
 mod cleanup;
 mod engine;
@@ -113,9 +114,13 @@ fn main() -> anyhow::Result<()> {
     let remote_state = Arc::new(remote::RemoteState::load(&st.data_dir, remote::computer_name()));
     sync::init_device(&remote_state.self_id());
     let sync_hub = Arc::new(sync::SyncHub::new(&st.data_dir, remote_state.self_id(), sync::SettingsIo::App));
+    let placer = Arc::new(archive::AppPlacer { st: st.clone(), app: std::sync::OnceLock::new() });
+    let receiver = Arc::new(archive::Receiver::new(archive::archive_dir_setting(), placer.clone()));
+    let archiver = Arc::new(archive::Archiver::new());
     let setup_state = st.clone();
     let si_state = st.clone();
     let (setup_remote, setup_hub) = (remote_state.clone(), sync_hub.clone());
+    let setup_archiver = archiver.clone();
     tauri::Builder::default()
         // Must be first. A second launch hands argv to us and exits; on macOS the
         // deep-link plugin ignores forwarded argv, so magnets are handled here too.
@@ -127,6 +132,8 @@ fn main() -> anyhow::Result<()> {
         .manage(st.clone())
         .manage(remote_state)
         .manage(sync_hub)
+        .manage(receiver)
+        .manage(archiver)
         .setup(move |app| {
             let handle = app.handle().clone();
 
@@ -156,6 +163,10 @@ fn main() -> anyhow::Result<()> {
             remote::spawn(handle.clone(), setup_state.clone());
             // Mac↔Mac sync of watch state, groups and shared settings.
             sync::spawn(handle.clone(), setup_hub.clone(), setup_remote.clone());
+            // Archive moves to / auto-clean on the archive Mac (LAN only).
+            let _ = placer.app.set(handle.clone());
+            archive::spawn(handle.clone(), setup_state.clone(), setup_remote.clone(), setup_archiver.clone());
+            archive::spawn_autoclean(setup_state.clone());
             // Mobile-data mode (path monitor + 1 s loop, "net-status" events).
             netmode::spawn_background(handle.clone(), setup_state.clone());
 
@@ -253,6 +264,11 @@ fn main() -> anyhow::Result<()> {
             notify::notify_set_settings,
             cleanup::cleanup_candidates,
             cleanup::cleanup_apply,
+            // archive moves (Mac mini / NEO Storage)
+            archive::archive_settings,
+            archive::archive_set_settings,
+            archive::archive_move,
+            archive::archive_status,
         ])
         .run(tauri::generate_context!())?;
 

@@ -166,7 +166,7 @@ fn gather(st: &AppState) -> Vec<TInfo> {
     out
 }
 
-fn candidates(st: &AppState, min_age_days: u64) -> Result<Vec<CleanupCandidate>, String> {
+pub(crate) fn candidates(st: &AppState, min_age_days: u64) -> Result<Vec<CleanupCandidate>, String> {
     let watched = crate::groups::get_watched()?;
     Ok(select(&gather(st), &watched, now_secs(), min_age_days))
 }
@@ -188,7 +188,7 @@ pub async fn cleanup_apply(state: St<'_>, items: Vec<CleanupItem>) -> Result<Cle
     apply(&state, items).await
 }
 
-async fn apply(st: &AppState, items: Vec<CleanupItem>) -> Result<CleanupResult, String> {
+pub(crate) async fn apply(st: &AppState, items: Vec<CleanupItem>) -> Result<CleanupResult, String> {
     let valid = candidates(st, 0)?;
     let mut res = CleanupResult { removed: vec![], skipped: vec![], freed_bytes: 0 };
     let mut per_torrent: BTreeMap<String, Vec<CleanupCandidate>> = BTreeMap::new();

@@ -1000,6 +1000,100 @@ async fn migrate_one(st: &AppState, tidebox: &Path, h: &Handle) -> Result<Option
     }
 }
 
+// ---------------------------------------------------------------- archive (archive.rs)
+
+/// What an archive move of a completed torrent sends.
+pub(crate) struct TorrentLayout {
+    pub name: String,
+    pub torrent_bytes: Vec<u8>,
+    /// The torrent's own output folder (every rel path is under it).
+    pub base: PathBuf,
+    /// (rel path with '/', size) of every selected, non-padding file.
+    pub files: Vec<(String, u64)>,
+    pub only_files: Option<Vec<usize>>,
+}
+
+pub(crate) fn archive_layout(st: &AppState, key: &str) -> Result<TorrentLayout, String> {
+    let h = handle(st, key)?;
+    if !h.stats().finished {
+        return Err(not_ready("download is not finished"));
+    }
+    let only = h.only_files();
+    let (bytes, files) = h
+        .with_metadata(|m| {
+            let files: Vec<(String, u64)> = m
+                .file_infos
+                .iter()
+                .enumerate()
+                .filter(|(i, f)| !f.attrs.padding && only.as_ref().is_none_or(|o| o.contains(i)))
+                .map(|(_, f)| {
+                    let rel = f
+                        .relative_filename
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    (rel, f.len)
+                })
+                .collect();
+            (m.torrent_bytes.to_vec(), files)
+        })
+        .map_err(|_| not_ready("metadata not resolved yet"))?;
+    if bytes.is_empty() {
+        return Err(internal("no stored torrent bytes"));
+    }
+    let base = h.output_folder().to_path_buf();
+    let name = base.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| display_name(&h));
+    Ok(TorrentLayout { name, torrent_bytes: bytes, base, files, only_files: only })
+}
+
+/// Is `key` in the session and fully downloaded?
+pub(crate) fn has_complete(session: &Session, key: &str) -> bool {
+    let Ok(id) = parse_key(key) else { return false };
+    session.get(TorrentIdOrHash::Hash(id)).is_some_and(|h| {
+        let s = h.stats();
+        s.finished && s.total_bytes > 0
+    })
+}
+
+/// Add a torrent whose data is already complete in `folder`: paused (never seeds, no
+/// network), librqbit checks the files. Errors (and forgets it again, files kept) when
+/// the check does not find it complete. Returns the key.
+pub(crate) async fn add_archived(session: &Arc<Session>, bytes: Vec<u8>, folder: &Path, only_files: Option<Vec<usize>>) -> Result<String, String> {
+    let opts = AddTorrentOptions {
+        paused: true,
+        overwrite: true,
+        output_folder: Some(folder.to_string_lossy().into_owned()),
+        only_files,
+        ..Default::default()
+    };
+    let h = match session.add_torrent(AddTorrent::from_bytes(bytes), Some(opts)).await {
+        Ok(AddTorrentResponse::Added(_, h)) => h,
+        Ok(AddTorrentResponse::AlreadyManaged(_, h)) => {
+            let key = h.info_hash().as_string();
+            return if has_complete(session, &key) { Ok(key) } else { Err(invalid("torrent already managed here and incomplete")) };
+        }
+        Ok(AddTorrentResponse::ListOnly(_)) => return Err(internal("unexpected list-only answer")),
+        Err(e) => return Err(internal(format!("add failed: {e:#}"))),
+    };
+    let key = h.info_hash().as_string();
+    // A full file check of a big archive takes a while.
+    let checked = tokio::time::timeout(Duration::from_secs(3 * 3600), h.wait_until_initialized()).await;
+    let ok = matches!(checked, Ok(Ok(()))) && {
+        let s = h.stats();
+        s.finished && s.total_bytes > 0
+    };
+    if !ok {
+        let s = h.stats();
+        let _ = session.delete(TorrentIdOrHash::Hash(h.info_hash()), false).await;
+        return Err(format!("VERIFY_FAILED: librqbit found {} of {} bytes", s.progress_bytes, s.total_bytes));
+    }
+    if !h.is_paused() {
+        let _ = session.pause(&h).await;
+    }
+    Ok(key)
+}
+
 // ---------------------------------------------------------------- commands
 
 #[tauri::command]

@@ -14,6 +14,9 @@
 //!   offline MediaInfo, media files), `GET /v1/art/<key>/<poster|backdrop>` (sidecar
 //!   bytes), `POST /v1/stream-token {key,fileIndex}` (tokenized stream + subtitle URLs,
 //!   a `PlayRequest`), `GET /v1/sync/state?since=<ms>`, `POST /v1/sync/push` (sync.rs).
+//! - Archive moves (all Bearer + `X-Tide-Id`, archive.rs): `GET /v1/archive/info`,
+//!   `POST /v1/archive/begin`, `PUT /v1/archive/<upload>/<rel path>` (Content-Range),
+//!   `POST /v1/archive/<upload>/commit`.
 //!
 //! Stream/subtitle tokens are random, per play request, bound to one torrent file
 //! (+ its subtitle files) and expire; nothing else on disk is reachable.
@@ -51,6 +54,11 @@ const MAX_HEADER: usize = 16 * 1024;
 const MAX_BODY: usize = 64 * 1024;
 /// `POST /v1/sync/push` carries watch state for the whole library.
 const MAX_SYNC_BODY: usize = 8 * 1024 * 1024;
+/// `POST /v1/archive/begin` may carry big .torrent files (base64).
+const MAX_ARCHIVE_BEGIN: usize = 32 * 1024 * 1024;
+/// Header phase vs body phase of a request (archive chunks take a while on slow Wi-Fi).
+const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
+const BODY_TIMEOUT: Duration = Duration::from_secs(120);
 const ART_CACHE: usize = 64;
 const SUB_MAX_BYTES: usize = 2 * 1024 * 1024;
 
@@ -331,7 +339,7 @@ pub fn computer_name() -> String {
     clean_name(&std::env::var("HOST").unwrap_or_else(|_| "Mac".into()))
 }
 
-fn url_host(ip: IpAddr) -> String {
+pub(crate) fn url_host(ip: IpAddr) -> String {
     match ip {
         IpAddr::V4(v) => v.to_string(),
         IpAddr::V6(v) => format!("[{v}]"),
@@ -423,8 +431,10 @@ impl Request {
 
 async fn read_request<R: AsyncRead + Unpin>(sock: &mut R) -> std::io::Result<Request> {
     let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
+    let timed_out = || std::io::Error::new(std::io::ErrorKind::TimedOut, "request timeout");
     let mut buf = Vec::with_capacity(1024);
-    let mut tmp = [0u8; 2048];
+    let mut tmp = vec![0u8; 64 * 1024];
+    let deadline = tokio::time::Instant::now() + HEAD_TIMEOUT;
     let head_end = loop {
         if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             break p;
@@ -432,7 +442,7 @@ async fn read_request<R: AsyncRead + Unpin>(sock: &mut R) -> std::io::Result<Req
         if buf.len() > MAX_HEADER {
             return Err(bad("header too large"));
         }
-        let n = sock.read(&mut tmp).await?;
+        let n = tokio::time::timeout_at(deadline, sock.read(&mut tmp)).await.map_err(|_| timed_out())??;
         if n == 0 {
             return Err(bad("eof"));
         }
@@ -456,13 +466,23 @@ async fn read_request<R: AsyncRead + Unpin>(sock: &mut R) -> std::io::Result<Req
         .find(|(k, _)| k == "content-length")
         .and_then(|(_, v)| v.parse().ok())
         .unwrap_or(0);
-    let limit = if path == "/v1/sync/push" { MAX_SYNC_BODY } else { MAX_BODY };
+    let limit = if path == "/v1/sync/push" {
+        MAX_SYNC_BODY
+    } else if path == "/v1/archive/begin" {
+        MAX_ARCHIVE_BEGIN
+    } else if method == "PUT" && path.starts_with("/v1/archive/") {
+        crate::archive::MAX_CHUNK
+    } else {
+        MAX_BODY
+    };
     if len > limit {
         return Err(bad("body too large"));
     }
     let mut body = buf[head_end + 4..].to_vec();
+    body.reserve(len.saturating_sub(body.len()));
+    let deadline = tokio::time::Instant::now() + BODY_TIMEOUT;
     while body.len() < len {
-        let n = sock.read(&mut tmp).await?;
+        let n = tokio::time::timeout_at(deadline, sock.read(&mut tmp)).await.map_err(|_| timed_out())??;
         if n == 0 {
             break;
         }
@@ -476,6 +496,9 @@ fn reason(code: u16) -> &'static str {
     match code {
         200 => "OK",
         206 => "Partial Content",
+        409 => "Conflict",
+        503 => "Service Unavailable",
+        507 => "Insufficient Storage",
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
@@ -631,6 +654,10 @@ pub(crate) trait Backend: Send + Sync + 'static {
     fn sync_push(&self, _from: &str, _body: serde_json::Value) -> Result<serde_json::Value, String> {
         Err("NOT_FOUND: sync unavailable".into())
     }
+    /// Receiving side of archive moves (archive.rs).
+    fn archive(&self) -> Option<Arc<crate::archive::Receiver>> {
+        None
+    }
 }
 
 /// What `stream-token` needs to know about one media file.
@@ -715,10 +742,10 @@ async fn serve(listener: TcpListener, ctx: Arc<Ctx>) {
 }
 
 async fn handle_conn(mut sock: TcpStream, peer: SocketAddr, ctx: &Ctx) -> std::io::Result<()> {
-    let req = match tokio::time::timeout(Duration::from_secs(10), read_request(&mut sock)).await {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Ok(()),
+    let req = match read_request(&mut sock).await {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Ok(()),
+        Err(e) => return Err(e),
     };
     route(&mut sock, &req, peer.ip().to_canonical(), ctx).await
 }
@@ -868,11 +895,58 @@ async fn route(w: &mut TcpStream, req: &Request, peer: IpAddr, ctx: &Ctx) -> std
                 Err(e) => respond_err(w, 400, &e).await,
             }
         }
+        (_, ["v1", "archive", ..]) => archive_srv(w, req, peer, &segs, ctx).await,
         ("POST", ["v1", "pair", "start"]) => pair_start_srv(w, req, ctx).await,
         ("POST", ["v1", "pair", "finish"]) => pair_finish_srv(w, req, peer, ctx).await,
         (m, ["v1", ..]) if m != "GET" && m != "HEAD" && m != "POST" => respond_err(w, 405, "method").await,
         _ => respond_err(w, 404, "not found").await,
     }
+}
+
+/// HTTP status for an archive error string ("CODE: message").
+fn archive_status(e: &str) -> u16 {
+    match e.split(':').next().unwrap_or("") {
+        "INVALID_INPUT" => 400,
+        "UNAUTHORIZED" => 401,
+        "NOT_FOUND" => 404,
+        "RANGE_MISMATCH" | "BUSY" => 409,
+        "ARCHIVE_UNAVAILABLE" | "NOT_ARCHIVE" => 503,
+        "ARCHIVE_FULL" => 507,
+        _ => 500,
+    }
+}
+
+/// `/v1/archive/...` (paired devices only).
+async fn archive_srv(w: &mut TcpStream, req: &Request, peer: IpAddr, segs: &[&str], ctx: &Ctx) -> std::io::Result<()> {
+    let Some(id) = authed(req, ctx) else { return respond_err(w, 401, "unauthorized").await };
+    ctx.rs.touch_device(&id, None, None, Some(peer));
+    let Some(rcv) = ctx.be.archive() else { return respond_err(w, 503, "NOT_ARCHIVE: archive unavailable").await };
+    let done = |r: Result<serde_json::Value, String>| match r {
+        Ok(v) => (200, v),
+        Err(e) => (archive_status(&e), json!({ "error": e })),
+    };
+    let (code, v) = match (req.method.as_str(), segs) {
+        ("GET", ["v1", "archive", "info"]) => (200, rcv.info()),
+        ("POST", ["v1", "archive", "begin"]) => match serde_json::from_slice::<crate::archive::BeginReq>(&req.body) {
+            Ok(b) => done(rcv.begin(&id, b).await),
+            Err(e) => (400, json!({ "error": format!("INVALID_INPUT: {e}") })),
+        },
+        ("POST", ["v1", "archive", upload, "commit"]) => done(rcv.commit(&id, upload).await),
+        ("PUT", ["v1", "archive", upload, rest @ ..]) if !rest.is_empty() => {
+            let rel: Option<Vec<String>> =
+                rest.iter().map(|s| urlencoding::decode(s).ok().map(|c| c.into_owned())).collect();
+            let range = req.header("content-range").and_then(crate::archive::parse_content_range);
+            match (rel, range) {
+                (Some(rel), Some(range)) => match rcv.put(&id, upload, &rel.join("/"), range, &req.body).await {
+                    Ok(have) => (200, json!({ "have": have })),
+                    Err((e, have)) => (archive_status(&e), json!({ "error": e, "have": have })),
+                },
+                _ => (400, json!({ "error": "INVALID_INPUT: bad path or Content-Range" })),
+            }
+        }
+        _ => (404, json!({ "error": "not found" })),
+    };
+    respond_json(w, code, v).await
 }
 
 /// Paired device id when the request carries its Bearer secret + `X-Tide-Id`.
@@ -999,7 +1073,7 @@ pub(crate) async fn post_json(
     answer(status, text.as_bytes())
 }
 
-fn answer(status: u16, body: &[u8]) -> Result<serde_json::Value, String> {
+pub(crate) fn answer(status: u16, body: &[u8]) -> Result<serde_json::Value, String> {
     let v: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
     if (200..300).contains(&status) {
         Ok(v)
@@ -1483,7 +1557,7 @@ fn decode_data_url(url: &str) -> Option<(Vec<u8>, String)> {
     Some((base64_decode(b64)?, mime.to_string()))
 }
 
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let val = |c: u8| -> Option<u32> {
         Some(match c {
             b'A'..=b'Z' => c - b'A',
@@ -1620,6 +1694,10 @@ impl Backend for AppBackend {
     fn sync_push(&self, from: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
         let hub = self.app.state::<Arc<crate::sync::SyncHub>>();
         hub.serve_push(from, body)
+    }
+
+    fn archive(&self) -> Option<Arc<crate::archive::Receiver>> {
+        self.app.try_state::<Arc<crate::archive::Receiver>>().map(|s| s.inner().clone())
     }
 }
 

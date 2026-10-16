@@ -864,6 +864,10 @@ function openMenu(anchor, ctx) {
     const key = ctx.key, gid = rows.get(key) && rows.get(key).group;
     items.push(menuItem('Add to group…', () => groupPicker(key, gid)));
     if (gid) items.push(menuItem('Remove from group', () => { closeMenu(); act(invoke('remove_from_group', { key })); }));
+    const target = archiveTarget(), row = rows.get(key);
+    if (target && row && row.last && row.last.state === 'completed') {
+      items.push(menuItem(`Move to ${target}`, () => { closeMenu(); archiveMove({ key }); }));
+    }
   } else {
     const gr = lastGroups.get(ctx.gid);
     if (!gr) return;
@@ -1948,6 +1952,8 @@ var MOCK = T ? null : (() => {
   const netFile = { detected: true, metered: true, expensive: true, constrained: false, mode: 'pause', limit_kbps: 200,
     paused_by_netmode: [hash(1), hash(2), hash(3)], ssid: 'Pixel 7', network_id: 'ssid:Pixel 7', manual: null };
   let notifyOn = true;
+  let arAuto = true;
+  let arQueue = [];
   const ago = (d) => Math.floor(Date.now() / 1000) - d * 86400;
   let cleanupItems = [
     { key: hash(1), file_index: null, name: 'Big Buck Bunny (2008)', size: 2.4 * GB, completed_at: ago(45) },
@@ -1996,6 +2002,11 @@ var MOCK = T ? null : (() => {
       return null;
     },
     remote_status: rStatus,
+    archive_settings: () => ({ archive_dir: null, available: false, free_bytes: null, error: null, autoclean_days: null, archive_auto: arAuto,
+      device: { id: 'd1', name: "mshn's Mac mini", online: true, available: true, archive_dir: '/Volumes/NEO Storage/Tidebox', free_bytes: 185e9 } }),
+    archive_set_settings: ({ archiveAuto }) => { if (archiveAuto != null) arAuto = archiveAuto; return api.archive_settings(); },
+    archive_status: () => ({ queue: arQueue, device: api.archive_settings().device, auto: arAuto }),
+    archive_move: ({ key }) => { arQueue = [{ kind: 'torrent', key, name: 'Animals (2026)', bytes_done: 1.2e9, bytes_total: 1.7e9, state: 'moving', error: null }]; return api.archive_status(); },
     remote_set_enabled: ({ enabled }) => { rEnabled = enabled; return rStatus(); },
     remote_discover: () => [{ id: 'd1', name: "mshn's Mac mini", host: '192.168.1.30', port: 47900, paired: !!rDevs.find((d) => d.id === 'd1') },
       { id: 'd2', name: 'Living Room iMac', host: '192.168.1.41', port: 47900, paired: !!rDevs.find((d) => d.id === 'd2') }],
@@ -2319,6 +2330,79 @@ rAdd.addEventListener('click', () => {
 });
 wGear.addEventListener('click', () => { if (!wPop.hidden) { rExtra.replaceChildren(); rSay(''); loadRemote(); loadSync(); } });
 
+// ---------- archive (Mac mini / NEO Storage) in the settings popover ----------
+let arSet = null; // archive_settings
+let arSt = null; // archive_status / "archive-progress"
+let arOk = true;
+const aSec = sSection('Archive');
+aSec.hidden = true;
+const aDir = h('p', 'whint adir');
+const aDays = h('input'); aDays.type = 'number'; aDays.min = '0'; aDays.max = '3650'; aDays.className = 'nkbps'; aDays.title = 'Days (0 = off)';
+const aDaysRow = h('div', 'nrow'); aDaysRow.append(h('span', null, 'Auto-delete watched items after'), aDays, h('span', 'wmuted', 'days'));
+const aAuto = h('input'); aAuto.type = 'checkbox';
+const aAutoText = document.createTextNode('');
+const aAutoL = h('label', 'check'); aAutoL.append(aAuto, aAutoText);
+const aLine = h('p', 'whint aline');
+aSec.append(aDir, aDaysRow, aAutoL, aLine);
+wPop.append(aSec);
+const archiveTarget = () => {
+  const d = arSet && !arSet.archive_dir && arSet.device;
+  return d ? d.name : null;
+};
+window.TideArchive = { target: archiveTarget, move: (args) => archiveMove(args) };
+function archiveLine() {
+  const q = (arSt && arSt.queue) || [];
+  const cur = q.find((e) => e.state === 'moving');
+  if (cur) return cur.bytes_total ? `Moving ${cur.name} — ${(cur.bytes_done / 1e9).toFixed(1)} / ${(cur.bytes_total / 1e9).toFixed(1)} GB` : `Moving ${cur.name}…`;
+  const waiting = q.filter((e) => e.state === 'queued').length;
+  const failed = q.find((e) => e.state === 'failed');
+  if (failed) return `Could not move ${failed.name}: ${errMsg(failed.error || '')}`;
+  const d = arSet && arSet.device;
+  if (waiting) return `${plural(waiting, 'item')} waiting${d && !d.online ? ` for ${d.name}` : ''}`;
+  if (d && !d.online) return `${d.name} is offline`;
+  if (d && d.online && !d.available) return errMsg(d.error || 'Archive not available');
+  return '';
+}
+function renderArchive() {
+  const s = arSet;
+  aSec.hidden = !s || (!s.archive_dir && !s.device);
+  if (aSec.hidden) return;
+  const isArchive = !!s.archive_dir;
+  aDir.hidden = !isArchive;
+  aDaysRow.hidden = !isArchive;
+  aAutoL.hidden = isArchive;
+  if (isArchive) {
+    aDir.textContent = s.available
+      ? `Archive folder: ${s.archive_dir}${s.free_bytes != null ? ` (${bytes(s.free_bytes)} free)` : ''}`
+      : `⚠︎ ${errMsg(s.error || 'Archive folder not available')}`;
+    aDir.classList.toggle('bad', !s.available);
+    if (document.activeElement !== aDays) aDays.value = s.autoclean_days == null ? 0 : s.autoclean_days;
+  } else {
+    aAutoText.textContent = ` Move finished downloads to ${s.device.name}`;
+    aAuto.checked = !!s.archive_auto;
+  }
+  const line = isArchive ? '' : archiveLine();
+  aLine.textContent = line;
+  aLine.hidden = !line;
+}
+function loadArchive() {
+  if (!arOk) return Promise.resolve();
+  return Promise.all([invoke('archive_settings'), invoke('archive_status')]).then(([s, st]) => { arSet = s; arSt = st; renderArchive(); if (window.YT) window.YT.refresh(); },
+    (e) => { if (missingCmd(e)) { arOk = false; arSet = null; renderArchive(); } });
+}
+const setArchive = (args) => invoke('archive_set_settings', args).then((s) => { arSet = s; renderArchive(); }, reportError);
+aAuto.addEventListener('change', () => setArchive({ archiveAuto: aAuto.checked }));
+aDays.addEventListener('change', () => setArchive({ autocleanDays: Math.max(0, Math.round(Number(aDays.value) || 0)) }));
+aDays.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); aDays.blur(); } });
+function archiveMove(args) {
+  return invoke('archive_move', args).then((st) => {
+    arSt = st; renderArchive();
+    const d = arSet && arSet.device;
+    toast(d && d.online ? `Moving to ${d.name}…` : `Will move when ${d ? d.name : 'the archive Mac'} is online`);
+  }, reportError);
+}
+wGear.addEventListener('click', () => { if (!wPop.hidden) loadArchive(); });
+
 // Incoming pair request (this Mac shows the code the other one must type).
 const prCard = h('div', 'prcard');
 prCard.hidden = true;
@@ -2347,6 +2431,7 @@ if (T) {
 }
 loadMoreSettings();
 loadRemote();
+loadArchive();
 syncRefresh();
 setInterval(() => { loadRemoteLib(); loadResume(); }, 30000);
 window.addEventListener('focus', loadResume);
@@ -2354,5 +2439,12 @@ if (T) {
   listen('sync-updated', () => syncRefresh());
   listen('remote-devices-updated', () => { loadRemote(); loadRemoteLib(); });
   listen('remote-pair-request', (e) => showPairRequest(e.payload || {}));
+  listen('archive-progress', (e) => {
+    const prev = arSt;
+    arSt = e.payload || null;
+    if (arSt && arSt.device && arSet) arSet.device = arSt.device;
+    if (!arSet && arSt && arSt.device) loadArchive(); else renderArchive();
+    if (prev && arSt && (prev.queue || []).length > (arSt.queue || []).length) refresh();
+  });
 }
 loadWatcher().then(() => invoke('watcher_check', { force: false })).then(setEpisodes, () => {});

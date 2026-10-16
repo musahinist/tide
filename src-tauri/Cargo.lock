@@ -5270,6 +5270,7 @@ dependencies = [
  "flate2",
  "librqbit",
  "librqbit-dualstack-sockets",
+ "librqbit-sha1-wrapper",
  "regex",
  "reqwest",
  "serde",

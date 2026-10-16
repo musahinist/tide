@@ -648,3 +648,8 @@ body:not(.has-remote) .rbtn, [hidden] + .rbtn { display: none !important; }
 .ldev { position: absolute; left: 6px; bottom: 8px; margin: 0; max-width: calc(100% - 12px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background: rgba(20, 20, 20, .78); color: #ccc; }
 .rsync { flex: none; color: var(--muted); font-size: 11px; }
 .rsync.bad { color: var(--err); }
+
+/* Archive (Mac mini / NEO Storage) */
+.wpop .adir { margin-bottom: 8px; word-break: break-word; }
+.wpop .adir.bad { color: var(--err); }
+.wpop .aline { margin: 6px 0 0; font-variant-numeric: tabular-nums; }
