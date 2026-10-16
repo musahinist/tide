@@ -91,6 +91,7 @@ body.active #hud,
 
 #hud select,
 #hud button,
+#next button,
 #msg button {
   font: inherit;
   color: var(--fg);
@@ -105,7 +106,7 @@ body.active #hud,
 }
 #hud select { max-width: 200px; padding-right: 6px; }
 #hud select:focus, #hud button:focus { outline: none; }
-#hud button:hover, #msg button:hover { border-color: rgba(255, 255, 255, 0.3); }
+#hud button:hover, #next button:hover, #msg button:hover { border-color: rgba(255, 255, 255, 0.3); }
 
 body.idle, body.idle #video { cursor: none; }
 
@@ -165,3 +166,35 @@ body.idle, body.idle #video { cursor: none; }
 }
 #msg .actions { display: flex; gap: 8px; justify-content: center; }
 #msg-get-vlc { background: var(--accent) !important; border-color: var(--accent) !important; color: #fff !important; }
+
+#hud button svg { display: block; }
+#airplay, #next-btn { padding: 0 8px; display: inline-flex; align-items: center; }
+#airplay[hidden], #next-btn[hidden] { display: none; }
+
+/* Next-episode prompt (bottom right, above the native control bar) */
+#next {
+  position: absolute;
+  right: 16px;
+  bottom: 76px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100% - 32px);
+  padding: 8px 10px 8px 14px;
+  border-radius: 8px;
+  background: var(--chip);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+}
+#next[hidden] { display: none; }
+#next .next-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+#next .next-text b { color: var(--fg); font-weight: 600; }
+#next-play { background: var(--accent) !important; border-color: var(--accent) !important; color: #fff !important; flex: none; }
+#next-cancel { flex: none; }

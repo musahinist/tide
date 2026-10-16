@@ -27,7 +27,7 @@ use tauri::State;
 use crate::engine;
 use crate::nameparse::{self, Confidence, Parsed};
 use crate::state::AppState;
-use crate::types::{FileKind, FileRow, MediaInfo, MediaType, TorrentState};
+use crate::types::{EpisodeFile, FileKind, FileRow, MediaInfo, MediaType, ParsedName, TorrentState};
 
 type St<'a> = State<'a, Arc<AppState>>;
 
@@ -1605,6 +1605,77 @@ fn http_date(t: std::time::SystemTime) -> String {
     )
 }
 
+// ---------------------------------------------------------------- grouping (offline)
+
+/// Offline name parse for instant grouping (no network).
+pub fn parsed_name(name: &str) -> ParsedName {
+    let p = nameparse::parse(name);
+    ParsedName {
+        norm: nameparse::norm_title(&p.title),
+        is_tv: p.is_tv(),
+        title: p.title,
+        year: p.year,
+        season: p.season,
+        episode: p.episode,
+    }
+}
+
+/// Episode files of a torrent: non-extra videos whose name (or "folder file") parses to an
+/// episode number. Season falls back to the folder, then the torrent name. Sorted by S/E.
+pub fn episodes_of(torrent_name: &str, files: &[FileRow]) -> Vec<EpisodeFile> {
+    let tp = nameparse::parse(torrent_name);
+    let mut out: Vec<EpisodeFile> = files
+        .iter()
+        .filter(|f| f.kind == FileKind::Video && !nameparse::is_extra(&f.name))
+        .filter_map(|f| {
+            let mut parts: Vec<&str> = f.name.split('/').collect();
+            let base = parts.pop()?;
+            let stem = base.rsplit_once('.').map_or(base, |(a, _)| a);
+            let dir_name = parts.pop();
+            let dir = dir_name.map(nameparse::parse);
+            let mut p = nameparse::parse(stem);
+            if p.episode.is_none() {
+                if let Some(d) = dir_name {
+                    let q = nameparse::parse(&format!("{d} {stem}"));
+                    if q.episode.is_some() {
+                        p = q;
+                    }
+                }
+            }
+            let episode = p.episode?;
+            let season = p.season.or(dir.and_then(|d| d.season)).or(tp.season);
+            let title = if p.title.trim().is_empty() || p.title.eq_ignore_ascii_case("episode") { tp.title.clone() } else { p.title };
+            Some(EpisodeFile {
+                file_index: f.index,
+                season,
+                episode,
+                norm: nameparse::norm_title(&title),
+                title_hint: title,
+                size: f.size,
+                progress: f.progress,
+            })
+        })
+        .collect();
+    out.sort_by_key(|e| (e.season.unwrap_or(u32::MAX), e.episode, e.file_index));
+    out
+}
+
+#[tauri::command]
+pub fn parse_names(names: Vec<String>) -> Vec<ParsedName> {
+    names.iter().map(|n| parsed_name(n)).collect()
+}
+
+#[tauri::command]
+pub fn list_episodes(state: St<'_>, key: String) -> Result<Vec<EpisodeFile>, String> {
+    let key = norm_key(&key);
+    let name = engine::list_rows(&state)
+        .into_iter()
+        .find(|r| r.key == key)
+        .map(|r| r.name)
+        .ok_or_else(|| format!("NOT_FOUND: no torrent {key}"))?;
+    Ok(episodes_of(&name, &engine::files(&state, &key)?))
+}
+
 // ---------------------------------------------------------------- tests
 
 #[cfg(test)]
@@ -2148,4 +2219,58 @@ mod tests {
         assert!(!heal_images(&ms3, &dd, &cm, "k2", &loc, &info2, 1000 + MISS_TTL).await);
         assert!(ms3.healed.lock().unwrap().contains("k2"));
     }
+
+    #[test]
+    fn pack_episodes() {
+        let v = |i: usize, n: &str| frow(i, n, 1_000_000_000, FileKind::Video);
+        let files = vec![
+            v(0, "Northern.Lights.S02.1080p/Northern.Lights.S02E02.1080p.WEB-DL.mkv"),
+            v(1, "Northern.Lights.S02.1080p/Northern.Lights.S02E01.1080p.WEB-DL.mkv"),
+            frow(2, "Northern.Lights.S02.1080p/Northern.Lights.S02E01.en.srt", 40_000, FileKind::Subtitle),
+            v(3, "Northern.Lights.S02.1080p/Sample/northern.lights.s02e01.sample.mkv"),
+            v(4, "Northern.Lights.S02.1080p/Northern.Lights.S02E03.1080p.WEB-DL.mkv"),
+            v(5, "Northern.Lights.S02.1080p/Featurettes/Making.Of.mkv"),
+        ];
+        let eps = episodes_of("Northern.Lights.S02.1080p.WEB-DL", &files);
+        let se: Vec<_> = eps.iter().map(|e| (e.file_index, e.season, e.episode)).collect();
+        assert_eq!(se, vec![(1, Some(2), 1), (0, Some(2), 2), (4, Some(2), 3)]);
+        assert!(eps.iter().all(|e| e.norm == "northern lights" && e.title_hint == "Northern Lights"));
+
+        // "Season 3/Episode 05.mkv": season from the folder, show from the torrent name.
+        let files = vec![v(0, "Show Name/Season 3/Episode 05.mkv"), v(1, "Show Name/Season 3/Episode 06.mkv")];
+        let eps = episodes_of("Show Name Season 3 Complete", &files);
+        let se: Vec<_> = eps.iter().map(|e| (e.season, e.episode, e.norm.as_str())).collect();
+        assert_eq!(se, vec![(Some(3), 5, "show name"), (Some(3), 6, "show name")]);
+
+        // A movie with a sample and a single-episode torrent are not packs.
+        let files = vec![v(0, "Movie.2010.1080p/Movie.2010.1080p.mkv"), v(1, "Movie.2010.1080p/Sample.mkv")];
+        assert!(episodes_of("Movie.2010.1080p", &files).is_empty());
+        let eps = episodes_of("Show.S01E04.720p", &[v(0, "Show.S01E04.720p.mkv")]);
+        assert_eq!(eps.len(), 1);
+
+        let p = parsed_name("The.Lighthouse.Keepers.S01E02.1080p.WEB-DL");
+        assert_eq!((p.norm.as_str(), p.season, p.episode, p.is_tv), ("lighthouse keepers", Some(1), Some(2), true));
+        let p = parsed_name("The Lighthouse Keepers S01 1080p");
+        assert_eq!((p.norm.as_str(), p.season, p.episode, p.is_tv), ("lighthouse keepers", Some(1), None, true));
+        assert!(!parsed_name("Sintel.2010.2160p.mkv").is_tv);
+    }
+}
+
+// ---------------------------------------------------------------- accessors (subfetch)
+
+/// Media info for `key` without any network: memory, else the `tide.json` sidecar.
+pub fn offline_info(st: &AppState, key: &str) -> Option<MediaInfo> {
+    let key = norm_key(key);
+    if let Some(i) = st.meta.cached(&st.data_dir, &key) {
+        return Some(i);
+    }
+    let tj = read_sidecar(&locate(st, &key).ok()?)?;
+    let mut info = tj.info;
+    info.manual = tj.manual;
+    Some(info)
+}
+
+/// The shared metadata HTTP client (timeouts, user agent, https-only redirects).
+pub fn http_client(st: &AppState) -> reqwest::Client {
+    st.meta.http()
 }

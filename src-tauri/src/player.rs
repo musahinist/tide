@@ -106,6 +106,42 @@ async fn media_source(st: &AppState, key: &str, row: &FileRow) -> Result<Source,
     Ok(Source::Stream(engine::stream_url(st, key, row.index)?))
 }
 
+/// MP4/MOV files often keep their index (`moov`) at the end; WebKit then asks for the
+/// tail right after the first bytes. librqbit prioritises the 32 MiB after each open
+/// stream's position (also for a Range request near the end), so opening a short-lived
+/// stream on the last `TAIL_PREFETCH` bytes now starts fetching those pieces in parallel
+/// with the head instead of one round trip later. Pieces are needed anyway (no extra data).
+const TAIL_PREFETCH: u64 = 2 * 1024 * 1024;
+const TAIL_TIMEOUT_S: u64 = 90;
+
+fn prefetch_mp4_tail(st: &Arc<AppState>, key: &str, row: &FileRow) {
+    let ext = row.name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    if row.progress >= 1.0 || row.size <= TAIL_PREFETCH * 4 || !matches!(ext.as_str(), "mp4" | "m4v" | "mov") {
+        return;
+    }
+    let Ok(id) = key.parse::<librqbit::dht::Id20>() else { return };
+    let (st, idx, size) = (st.clone(), row.index, row.size);
+    tauri::async_runtime::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let fut = async {
+            let mut s = st
+                .api
+                .api_stream(librqbit::api::TorrentIdOrHash::Hash(id), idx)
+                .await
+                .map_err(|e| e.to_string())?;
+            s.seek(std::io::SeekFrom::Start(size - TAIL_PREFETCH)).await.map_err(|e| e.to_string())?;
+            let mut sink = tokio::io::sink();
+            tokio::io::copy(&mut s.take(TAIL_PREFETCH), &mut sink).await.map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(TAIL_TIMEOUT_S), fut).await {
+            Ok(Ok(())) => tracing::debug!("prefetched tail of file {idx}"),
+            Ok(Err(e)) => tracing::debug!("tail prefetch of file {idx} failed: {e}"),
+            Err(_) => tracing::debug!("tail prefetch of file {idx} timed out"),
+        }
+    });
+}
+
 /// Builtin player URL for a file on disk (Tauri asset protocol; the file is added to
 /// the asset scope here, nothing else is reachable).
 fn asset_url(app: &AppHandle, path: &Path) -> Result<String, String> {
@@ -116,6 +152,12 @@ fn asset_url(app: &AppHandle, path: &Path) -> Result<String, String> {
 async fn vtt_for(st: &AppState, sub_id: &str) -> Result<Arc<String>, String> {
     if let Some(v) = st.player.vtt_cache.lock().map_err(internal)?.get(sub_id) {
         return Ok(v.clone());
+    }
+    if sub_id.starts_with("o:") {
+        // Online subtitle saved by subfetch (outside the torrent's file list).
+        let vtt = Arc::new(crate::subfetch::vtt_for_track(st, sub_id)?);
+        st.player.vtt_cache.lock().map_err(internal)?.insert(sub_id.to_string(), vtt.clone());
+        return Ok(vtt);
     }
     let (key, idx) = subtitles::parse_track_id(sub_id).ok_or("INVALID_INPUT: bad subtitle id")?;
     let (_, row) = find_file(st, &key, idx)?;
@@ -129,6 +171,9 @@ async fn vtt_for(st: &AppState, sub_id: &str) -> Result<Arc<String>, String> {
 /// Write a subtitle to `data_dir/subs/<key>_<idx>.<ext>` for VLC. Waits at most
 /// `VLC_SUB_TIMEOUT_S` for an incomplete file.
 async fn subtitle_to_disk(st: &AppState, sub_id: &str) -> Result<PathBuf, String> {
+    if sub_id.starts_with("o:") {
+        return crate::subfetch::resolve_track(st, sub_id).ok_or_else(|| "NOT_FOUND: unknown online subtitle".into());
+    }
     let (key, idx) = subtitles::parse_track_id(sub_id).ok_or("INVALID_INPUT: bad subtitle id")?;
     let (_, row) = find_file(st, &key, idx)?;
     let ext = row.name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_else(|| "srt".into());
@@ -187,7 +232,9 @@ async fn launch_vlc(st: &AppState, key: &str, idx: usize, sub_id: Option<&str>) 
         Source::Stream(u) => u,
     };
     let title = basename(&row.name).to_string();
-    let (subtitles, default_sub) = subtitle_tracks(key, &files, &row);
+    let (mut subtitles, default_sub) = subtitle_tracks(key, &files, &row);
+    let media = MediaRef::Torrent { key: key.to_string(), file_index: idx };
+    subtitles.extend(crate::subfetch::saved_tracks(st, &media).await);
     let sub_path = match sub_id {
         Some(id) => match subtitle_to_disk(st, id).await {
             Ok(p) => Some(p),
@@ -215,7 +262,10 @@ async fn launch_vlc(st: &AppState, key: &str, idx: usize, sub_id: Option<&str>) 
 #[tauri::command]
 pub async fn play_media(app: AppHandle, state: St<'_>, media: MediaRef) -> Result<PlayResult, String> {
     let st: Arc<AppState> = state.inner().clone();
-    let MediaRef::Torrent { key, file_index } = media;
+    let (key, file_index) = match media {
+        MediaRef::Torrent { key, file_index } => (key, file_index),
+        MediaRef::Yt { id } => return play_yt(&app, &st, &id),
+    };
     let key = key.to_ascii_lowercase();
     valid_key(&key)?;
 
@@ -225,15 +275,34 @@ pub async fn play_media(app: AppHandle, state: St<'_>, media: MediaRef) -> Resul
     }
 
     if !row.playable_builtin {
-        let (_, default_sub) = subtitle_tracks(&key, &files, &row);
+        let (_, mut default_sub) = subtitle_tracks(&key, &files, &row);
+        if default_sub.is_none() && row.kind == FileKind::Video {
+            // VLC can't add a track later: give the online lookup a short window.
+            let m = MediaRef::Torrent { key: key.clone(), file_index };
+            let wait = std::time::Duration::from_secs(VLC_SUB_TIMEOUT_S);
+            let online = match tokio::time::timeout(wait, crate::subfetch::online_tracks(&st, &m)).await {
+                Ok(t) => t,
+                Err(_) => crate::subfetch::saved_tracks(&st, &m).await,
+            };
+            default_sub = online.first().map(|t| t.id.clone());
+        }
         return launch_vlc(&st, &key, file_index, default_sub.as_deref()).await;
     }
 
     let stream_url = match media_source(&st, &key, &row).await? {
         Source::Disk(p) => asset_url(&app, &p)?,
-        Source::Stream(u) => u,
+        Source::Stream(u) => {
+            prefetch_mp4_tail(&st, &key, &row);
+            u
+        }
     };
-    let (subtitles, default_subtitle_id) = subtitle_tracks(&key, &files, &row);
+    let (mut subtitles, mut default_subtitle_id) = subtitle_tracks(&key, &files, &row);
+    // Online subtitles already on disk (no request; the player fetches new ones later).
+    let saved = crate::subfetch::saved_tracks(&st, &MediaRef::Torrent { key: key.clone(), file_index }).await;
+    if default_subtitle_id.is_none() {
+        default_subtitle_id = saved.first().map(|t| t.id.clone());
+    }
+    subtitles.extend(saved);
     let result = PlayResult {
         mode: PlayMode::Builtin,
         title: basename(&row.name).to_string(),
@@ -254,6 +323,25 @@ pub async fn play_media(app: AppHandle, state: St<'_>, media: MediaRef) -> Resul
         });
     }
 
+    show_player(&app, &st, result)
+}
+
+/// v2: a finished yt-dlp download, played from disk through the asset protocol.
+fn play_yt(app: &AppHandle, st: &AppState, id: &str) -> Result<PlayResult, String> {
+    let (path, title) = crate::ytdlp::job_file(st, id).ok_or("NOT_FOUND: download is not finished")?;
+    let result = PlayResult {
+        mode: PlayMode::Builtin,
+        title,
+        media: MediaRef::Yt { id: id.to_string() },
+        stream_url: asset_url(app, &path)?,
+        subtitles: Vec::new(),
+        default_subtitle_id: None,
+    };
+    show_player(app, st, result)
+}
+
+/// Remember `result` and load it into the player window (created if needed).
+fn show_player(app: &AppHandle, st: &AppState, result: PlayResult) -> Result<PlayResult, String> {
     *st.player.current.lock().map_err(internal)? = Some(result.clone());
 
     if let Some(w) = app.get_webview_window("player") {
@@ -264,7 +352,7 @@ pub async fn play_media(app: AppHandle, state: St<'_>, media: MediaRef) -> Resul
         app.emit_to("player", "player-load", &result).map_err(internal)?;
     } else {
         // The new window calls `player_current` on load.
-        WebviewWindowBuilder::new(&app, "player", WebviewUrl::App("player.html".into()))
+        WebviewWindowBuilder::new(app, "player", WebviewUrl::App("player.html".into()))
             .title(&result.title)
             .inner_size(960., 540.)
             .min_inner_size(320., 180.)
@@ -297,7 +385,18 @@ pub async fn open_in_vlc(
     sub_id: Option<String>,
 ) -> Result<(), String> {
     let st: Arc<AppState> = state.inner().clone();
-    let MediaRef::Torrent { key, file_index } = media;
+    let (key, file_index) = match media {
+        MediaRef::Torrent { key, file_index } => (key, file_index),
+        MediaRef::Yt { id } => {
+            let vlc = find_vlc().ok_or("VLC_NOT_FOUND: VLC is not installed")?;
+            let (path, title) = crate::ytdlp::job_file(&st, &id).ok_or("NOT_FOUND: download is not finished")?;
+            spawn_vlc(&vlc, &title, &path.to_string_lossy(), None)?;
+            if let Some(w) = app.get_webview_window("player") {
+                let _ = w.close();
+            }
+            return Ok(());
+        }
+    };
     let key = key.to_ascii_lowercase();
     valid_key(&key)?;
     launch_vlc(&st, &key, file_index, sub_id.as_deref()).await?;

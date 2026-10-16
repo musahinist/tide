@@ -19,6 +19,13 @@
   const msgText = $('msg-text');
   const msgGetVlc = $('msg-get-vlc');
   const msgVlc = $('msg-vlc');
+  const airBtn = $('airplay');
+  const nextBtn = $('next-btn');
+  const nextBox = $('next');
+  const nextLabel = $('next-label');
+  const nextCount = $('next-count');
+  const nextPlay = $('next-play');
+  const nextCancel = $('next-cancel');
 
   const AUDIO_EXT = new Set(['mp3', 'm4a', 'aac', 'wav', 'flac', 'ogg', 'oga', 'opus', 'aif', 'aiff']);
   const VLC_URL = 'https://www.videolan.org/vlc/';
@@ -27,6 +34,7 @@
   let el = video;          // active media element
   let isAudio = false;
   let selectedSub = null;  // track id or null
+  let subTouched = false;  // user picked from the menu for this item
   let fallingBack = false;
   let resumeApplied = false;
   const trackEls = new Map(); // sub id -> <track>
@@ -50,6 +58,18 @@
     if (!current || !current.media) return null;
     const m = current.media;
     return m.kind === 'torrent' ? `tide:resume:${m.key}:${m.fileIndex}` : null;
+  }
+
+  // Duration next to the resume position (main window's "Continue watching").
+  const durKey = () => { const k = resumeKey(); return k ? k.replace('tide:resume:', 'tide:dur:') : null; };
+  function saveDuration() {
+    const k = durKey(), d = el.duration;
+    if (k && isFinite(d) && d > 0) lsSet(k, String(Math.round(d)));
+  }
+  function clearResume() {
+    const k = resumeKey(), dk = durKey();
+    if (k) lsDel(k);
+    if (dk) lsDel(dk);
   }
 
   function lsGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
@@ -86,7 +106,7 @@
     lastSave = now;
     const t = el.currentTime, d = el.duration;
     if (!isFinite(t) || t < 5) return;
-    if (isFinite(d) && d > 0 && (t >= 0.9 * d || d - t <= 10)) { lsDel(k); return; }
+    if (isFinite(d) && d > 0 && (t >= 0.9 * d || d - t <= 10)) { clearResume(); return; }
     lsSet(k, String(Math.floor(t)));
   }
 
@@ -152,7 +172,23 @@
     }
   }
 
+  // Online subtitles (backend downloads missing preferred languages once; no-op on
+  // metered networks). Merged into the menu; auto-selected only if nothing is chosen.
+  async function fetchOnlineSubs(pr) {
+    if (isAudio || !pr.media || pr.media.kind !== 'torrent') return;
+    let list = [];
+    try { list = await invoke('fetch_online_subtitles', { media: pr.media }); } catch (e) { console.warn('fetch_online_subtitles', e); }
+    if (current !== pr || !list || !list.length) return;
+    const have = new Set((pr.subtitles || []).map((s) => s.id));
+    const added = list.filter((s) => !have.has(s.id));
+    if (!added.length) return;
+    pr.subtitles = (pr.subtitles || []).concat(added);
+    renderSubOptions();
+    if (!selectedSub && !subTouched) selectSub(added[0].id);
+  }
+
   subsSel.addEventListener('change', () => {
+    subTouched = true;
     selectSub(subsSel.value);
     subsSel.blur();
   });
@@ -193,6 +229,134 @@
     invoke('open_external', { url: VLC_URL }).catch((e) => console.warn(e));
   });
 
+  // ------------------------------------------------------------ next episode
+
+  const NEXT_LEAD_S = 10;   // prompt this long before the end
+  const NEXT_COUNT_S = 5;   // autoplay countdown
+  let nextInfo = null;      // NextEpisode {media, title, label, builtin} | null
+  let nextSeq = 0;          // drops stale fetches after a source change
+  let nextShown = false;
+  let nextCancelled = false;
+  let nextLeft = 0;
+  let nextTimer = 0;
+  let watchedMarked = false;
+
+  async function fetchNext() {
+    const seq = ++nextSeq;
+    const m = current && current.media;
+    if (!m || m.kind !== 'torrent') { nextInfo = null; nextBtn.hidden = true; return null; }
+    let n = null;
+    try { n = await invoke('next_episode', { media: m }); } catch (e) { console.warn('next_episode', e); }
+    if (seq !== nextSeq) return null;
+    nextInfo = n || null;
+    nextBtn.hidden = !nextInfo;
+    if (nextInfo) nextBtn.title = `Next: ${nextInfo.label} (N)`;
+    return nextInfo;
+  }
+
+  function markWatched() {
+    const m = current && current.media;
+    if (watchedMarked || !m || m.kind !== 'torrent') return;
+    watchedMarked = true;
+    invoke('set_watched', { key: m.key, fileIndex: m.fileIndex, watched: true })
+      .then(() => T.event.emit('watched-changed', { key: m.key, fileIndex: m.fileIndex }).catch(() => {}))
+      .catch((e) => { watchedMarked = false; console.warn('set_watched', e); });
+  }
+
+  const nearEnd = () => {
+    const t = el.currentTime, d = el.duration;
+    return el.ended || (isFinite(d) && d > 0 && isFinite(t) && (d - t <= NEXT_LEAD_S + 2 || t >= 0.9 * d));
+  };
+
+  function hideNext() {
+    clearInterval(nextTimer);
+    nextTimer = 0;
+    nextShown = false;
+    nextBox.hidden = true;
+  }
+
+  function renderCount() {
+    nextCount.textContent = nextInfo && nextInfo.builtin ? ` — playing in ${nextLeft} s` : '';
+  }
+
+  async function showNext() {
+    if (nextShown || nextCancelled || fallingBack) return;
+    nextShown = true;
+    const forUrl = current && current.stream_url;
+    const n = await fetchNext(); // fresh: torrents may have progressed
+    // No next: stay "shown" (invisible) so timeupdate doesn't re-query until a seek back.
+    if (!n || !current || current.stream_url !== forUrl || !nextShown) return;
+    nextLabel.textContent = n.label;
+    nextPlay.textContent = n.builtin ? 'Play now' : 'Play in VLC';
+    nextLeft = NEXT_COUNT_S;
+    renderCount();
+    nextBox.hidden = false;
+    clearInterval(nextTimer);
+    if (!n.builtin) return; // VLC files: button only
+    nextTimer = setInterval(() => {
+      if (el.paused && !el.ended) return; // paused: hold the countdown
+      nextLeft -= 1;
+      renderCount();
+      if (nextLeft <= 0) playNext();
+    }, 1000);
+  }
+
+  async function playNext() {
+    const n = nextInfo || (await fetchNext());
+    if (!n) { flash('No next episode'); return; }
+    hideNext();
+    if (nearEnd()) markWatched();
+    savePosition(true);
+    try {
+      if (n.builtin) {
+        const pr = await invoke('play_media', { media: n.media });
+        if (pr && pr.mode === 'builtin') load(pr); // the player-load event repeats it (no-op)
+      } else {
+        try { el.pause(); } catch { /* ignore */ }
+        fallingBack = true;
+        showMessage('Opening in VLC…');
+        setSpinner(true);
+        await invoke('open_in_vlc', { media: n.media, subId: null });
+      }
+    } catch (e) {
+      fallingBack = false;
+      hideMessage();
+      flash(`Next episode unavailable: ${errText(e)}`);
+    }
+  }
+
+  function nextTick() {
+    if (nextCancelled || el.seeking) return;
+    const t = el.currentTime, d = el.duration;
+    if (!isFinite(d) || d <= 0 || !isFinite(t)) return;
+    const left = d - t;
+    if (!nextShown && left <= NEXT_LEAD_S && t > 1 && !el.paused) showNext();
+    else if (nextShown && left > NEXT_LEAD_S + 2) hideNext(); // seeked back
+  }
+
+  nextBtn.addEventListener('click', () => { nextBtn.blur(); playNext(); });
+  nextPlay.addEventListener('click', () => playNext());
+  nextCancel.addEventListener('click', () => { nextCancelled = true; hideNext(); });
+
+  // ------------------------------------------------------------ AirPlay
+
+  // WKWebView allows AirPlay by default (allowsAirPlayForMediaPlayback = YES; wry 0.57
+  // doesn't change it). The button only shows when a target is available.
+  if (window.WebKitPlaybackTargetAvailabilityEvent && video.webkitShowPlaybackTargetPicker) {
+    video.addEventListener('webkitplaybacktargetavailabilitychanged', (e) => {
+      airBtn.hidden = e.availability !== 'available';
+    });
+    video.addEventListener('webkitcurrentplaybacktargetiswirelesschanged', () => {
+      flash(video.webkitCurrentPlaybackTargetIsWireless ? 'Playing on AirPlay' : 'AirPlay off');
+    });
+    airBtn.addEventListener('click', () => {
+      airBtn.blur();
+      try { video.webkitShowPlaybackTargetPicker(); } catch (e) { console.warn('airplay', e); }
+    });
+  } else {
+    airBtn.remove();
+  }
+
   // ------------------------------------------------------------ media events
 
   function onLoadedMetadata(e) {
@@ -203,6 +367,7 @@
     }
     // Only audio files need an audio track; a silent video is fine.
     if (isAudio && el.audioTracks && el.audioTracks.length === 0) return openInVlc(true);
+    saveDuration();
     applyResume();
   }
 
@@ -219,6 +384,7 @@
 
   for (const m of [video, audio]) {
     m.addEventListener('loadedmetadata', onLoadedMetadata);
+    m.addEventListener('durationchange', () => { if (m === el && !fallingBack) saveDuration(); });
     m.addEventListener('error', onError);
     m.addEventListener('loadstart', () => m === el && setSpinner(true));
     m.addEventListener('waiting', () => m === el && setSpinner(true));
@@ -230,9 +396,15 @@
       if (m !== el) return;
       if (!m.paused && !m.seeking && m.readyState >= 3) setSpinner(false);
       savePosition(false);
+      nextTick();
     });
     m.addEventListener('pause', () => m === el && savePosition(true));
-    m.addEventListener('ended', () => { const k = resumeKey(); if (k) lsDel(k); });
+    m.addEventListener('ended', () => {
+      if (m !== el) return;
+      clearResume();
+      markWatched();
+      if (!nextCancelled) showNext();
+    });
     m.addEventListener('volumechange', () => {
       if (m === el) lsSet('tide:volume', String(m.muted ? 0 : m.volume));
     });
@@ -259,8 +431,15 @@
     hideMessage();
     fallingBack = false;
     resumeApplied = false;
+    hideNext();
+    nextCancelled = false;
+    watchedMarked = false;
+    nextInfo = null;
+    nextBtn.hidden = true;
 
     current = pr;
+    // Played from another Mac: the file lives there, so VLC here can't open it.
+    vlcBtn.style.display = pr.media && pr.media.kind === 'yt' && pr.media.id === 'remote' ? 'none' : '';
     document.title = pr.title || 'Player';
     isAudio = AUDIO_EXT.has(extOf(pr.title)) || AUDIO_EXT.has(extOf(decodeURIComponent(pr.stream_url)));
     el = isAudio ? audio : video;
@@ -278,6 +457,9 @@
     el.src = pr.stream_url;
     el.play().catch(() => { /* autoplay may need a gesture; native controls remain */ });
     if (selectedSub) selectSub(selectedSub);
+    subTouched = false;
+    fetchOnlineSubs(pr);
+    fetchNext();
   }
 
   // ------------------------------------------------------------ playback controls
@@ -340,6 +522,7 @@
       case 'Escape': if (fsElement()) toggleFullscreen(); else handled = false; break;
       case '>': case '.': changeSpeed(0.25); break;
       case '<': case ',': changeSpeed(-0.25); break;
+      case 'n': case 'N': playNext(); break;
       default: handled = false;
     }
     if (handled) { e.preventDefault(); e.stopPropagation(); poke(); }

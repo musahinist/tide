@@ -93,7 +93,7 @@ fn parse_key(key: &str) -> Result<Id20, String> {
 }
 
 /// Session handle for a key. Pending (resolving) keys → NOT_READY, unknown → NOT_FOUND.
-fn handle(st: &AppState, key: &str) -> Result<Handle, String> {
+pub(crate) fn handle(st: &AppState, key: &str) -> Result<Handle, String> {
     let id = parse_key(key)?;
     if let Some(h) = st.session.get(TorrentIdOrHash::Hash(id)) {
         return Ok(h);
@@ -408,21 +408,41 @@ pub async fn ensure_live(st: &AppState, key: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Keys seen unfinished during this run: only those get a "download finished"
+/// notification (a torrent restored already complete stays silent).
+static SEEN_UNFINISHED: LazyLock<Mutex<std::collections::HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
 /// Pause every Live torrent that has finished downloading (called by the 1 s ticker):
-/// Tide never uploads after a download completes.
+/// Tide never uploads after a download completes. Sends a completion notification.
 pub async fn pause_finished(st: &AppState) {
-    let done: Vec<Handle> = st.session.with_torrents(|it| {
-        it.filter(|(_, h)| {
+    // (handle, finished+Live, unfinished-with-metadata)
+    let all: Vec<(Handle, bool, bool)> = st.session.with_torrents(|it| {
+        it.map(|(_, h)| {
             let s = h.stats();
-            s.finished && matches!(s.state, TorrentStatsState::Live)
+            (h.clone(), s.finished && matches!(s.state, TorrentStatsState::Live), !s.finished && s.total_bytes > 0)
         })
-        .map(|(_, h)| h.clone())
         .collect()
     });
+    let mut done: Vec<Handle> = Vec::new();
+    {
+        let mut seen = SEEN_UNFINISHED.lock().unwrap();
+        for (h, live_done, unfinished) in all {
+            if unfinished {
+                seen.insert(h.info_hash().as_string());
+            } else if live_done {
+                done.push(h);
+            }
+        }
+    }
     for h in done {
+        let key = h.info_hash().as_string();
         match st.session.pause(&h).await {
-            Ok(()) => tracing::info!(key = %h.info_hash().as_string(), "download complete; paused (no seeding)"),
+            Ok(()) => tracing::info!(key = %key, "download complete; paused (no seeding)"),
             Err(e) => tracing::warn!("auto-pause of finished torrent failed: {e:#}"),
+        }
+        if SEEN_UNFINISHED.lock().unwrap().remove(&key) {
+            crate::notify::notify("Download finished", &display_name(&h));
         }
     }
 }
@@ -997,7 +1017,7 @@ pub async fn pause_torrent(state: St<'_>, key: String) -> Result<(), String> {
     pause(&state, &key).await
 }
 
-async fn pause(state: &AppState, key: &str) -> Result<(), String> {
+pub(crate) async fn pause(state: &AppState, key: &str) -> Result<(), String> {
     let h = handle(state, key)?;
     let paused_flag = h.is_paused();
     let already = h.with_state(|s| match s {
@@ -1030,7 +1050,7 @@ pub async fn remove_torrent(
     remove(&state, &key, delete_files).await
 }
 
-async fn remove(state: &AppState, key: &str, delete_files: bool) -> Result<(), String> {
+pub(crate) async fn remove(state: &AppState, key: &str, delete_files: bool) -> Result<(), String> {
     let id = parse_key(key)?;
     let k = id.as_string();
     let (was_pending, task) = {
@@ -1054,11 +1074,15 @@ async fn remove(state: &AppState, key: &str, delete_files: bool) -> Result<(), S
     // Also covers a resolve task that finished right before the abort.
     if state.session.get(TorrentIdOrHash::Hash(id)).is_some() {
         // Collected before forgetting the torrent (needs its row + file list).
-        let (sidecars, folder) = if delete_files {
+        let (mut sidecars, folder) = if delete_files {
             crate::metadata::sidecar_paths(state, &k)
         } else {
             (vec![], None)
         };
+        if delete_files {
+            // Online subtitles Tide saved next to the video (removed with the sidecars).
+            sidecars.extend(crate::subfetch::owned_files(state, &k));
+        }
         state
             .session
             .delete(TorrentIdOrHash::Hash(id), delete_files)
@@ -1076,6 +1100,9 @@ async fn remove(state: &AppState, key: &str, delete_files: bool) -> Result<(), S
             let _ = std::fs::remove_dir(&f);
         }
         crate::metadata::forget(state, &k);
+        if delete_files {
+            crate::subfetch::forget(state, &k);
+        }
         return Ok(());
     }
     if was_pending {

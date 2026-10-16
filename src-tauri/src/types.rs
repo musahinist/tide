@@ -67,6 +67,8 @@ pub enum MediaRef {
         #[serde(rename = "fileIndex")]
         file_index: usize,
     },
+    /// v2: a finished yt-dlp download ("yt-<n>").
+    Yt { id: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,4 +192,147 @@ pub struct GroupsFile {
     /// Keys the user removed from a group: never auto-grouped again.
     #[serde(default)]
     pub excluded: std::collections::BTreeMap<String, bool>,
+}
+
+// ---------------------------------------------------------------- yt-dlp (v2)
+
+/// Return value of `yt_probe`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct YtProbe {
+    pub url: String,
+    pub title: String,
+    pub uploader: Option<String>,
+    pub duration_secs: Option<f64>,
+    pub thumbnail: Option<String>,
+    pub is_live: bool,
+    pub max_height: Option<u32>,
+}
+
+/// Download presets (never above 720p).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum YtPreset {
+    #[serde(rename = "720p")]
+    P720,
+    #[serde(rename = "480p")]
+    P480,
+    #[serde(rename = "360p")]
+    P360,
+    #[serde(rename = "audio_mp3")]
+    AudioMp3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum YtJobState {
+    Queued,
+    Downloading,
+    Postprocessing,
+    Done,
+    Error,
+    Cancelled,
+}
+
+/// A yt-dlp download (`yt_list`, event `yt-jobs-updated`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct YtJob {
+    /// "yt-<n>"
+    pub id: String,
+    pub url: String,
+    pub title: String,
+    pub thumbnail: Option<String>,
+    pub preset: YtPreset,
+    pub state: YtJobState,
+    /// 0..1
+    pub progress: f64,
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub speed_bps: Option<f64>,
+    pub eta_secs: Option<u64>,
+    pub file_path: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Return value of `parse_names` (offline name parse; used for instant grouping).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ParsedName {
+    pub title: String,
+    /// `nameparse::norm_title(title)`: the grouping key.
+    pub norm: String,
+    pub year: Option<u16>,
+    pub season: Option<u32>,
+    pub episode: Option<u32>,
+    pub is_tv: bool,
+}
+
+/// One episode file inside a torrent (`list_episodes`; season packs).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EpisodeFile {
+    pub file_index: usize,
+    pub season: Option<u32>,
+    pub episode: u32,
+    /// Show title parsed from the file (or torrent) name.
+    pub title_hint: String,
+    /// `nameparse::norm_title(title_hint)`.
+    pub norm: String,
+    pub size: u64,
+    /// 0..1
+    pub progress: f64,
+}
+
+// ---------------------------------------------------------------- new-episode watcher
+
+/// Watcher settings (`data_dir/watcher.json` `settings`). Search goes only through a
+/// user-configured Torznab endpoint (Prowlarr / Jackett); empty URL = no search.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WatcherSettings {
+    pub torznab_url: String,
+    pub api_key: String,
+    pub auto_add: bool,
+    /// "1080p" | "720p" | "any"
+    pub quality: String,
+}
+
+impl Default for WatcherSettings {
+    fn default() -> Self {
+        WatcherSettings { torznab_url: String::new(), api_key: String::new(), auto_add: false, quality: "1080p".into() }
+    }
+}
+
+/// Return value of `watcher_get_settings` / `watcher_set_settings`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WatcherInfo {
+    #[serde(flatten)]
+    pub settings: WatcherSettings,
+    /// Series (IMDb ids) the user stopped following.
+    pub unfollowed: Vec<String>,
+    /// Unix seconds of the last completed check (0 = never).
+    pub last_check: u64,
+}
+
+/// One Torznab search result for a new episode.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TorznabResult {
+    pub title: String,
+    pub size: u64,
+    pub seeders: u32,
+    /// Always set (results without a magnet / info hash are dropped).
+    pub magnet: Option<String>,
+    /// "2160p" | "1080p" | "720p" | "480p" | null
+    pub quality: Option<String>,
+}
+
+/// An aired episode newer than the newest one in Tide (`watcher_check`, event `new-episodes`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewEpisode {
+    pub imdb_id: String,
+    pub show: String,
+    pub season: u32,
+    pub episode: u32,
+    pub episode_title: Option<String>,
+    /// Cinemeta `released` (ISO 8601).
+    pub released: Option<String>,
+    /// Best first (preferred quality, then seeders); at most 5. Empty without Torznab.
+    #[serde(default)]
+    pub results: Vec<TorznabResult>,
 }

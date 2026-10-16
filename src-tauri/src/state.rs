@@ -22,6 +22,8 @@ pub struct AppState {
     pub player: crate::player::PlayerState,
     /// WP6 movie/TV metadata; Default.
     pub meta: crate::metadata::MetaState,
+    /// v2 yt-dlp downloads; Default.
+    pub yt: crate::ytdlp::YtState,
 }
 
 #[allow(dead_code)]
@@ -149,5 +151,6 @@ pub async fn init() -> anyhow::Result<AppState> {
         pending: std::sync::Mutex::new(HashMap::new()),
         player: Default::default(),
         meta: Default::default(),
+        yt: Default::default(),
     })
 }

@@ -1,15 +1,23 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod artwork;
+mod cleanup;
 mod engine;
 mod groups;
 mod macos;
 mod metadata;
 mod nameparse;
+mod netmode;
+mod nextup;
+mod notify;
 mod player;
+mod remote;
 mod state;
+mod subfetch;
 mod subtitles;
 mod types;
+mod watcher;
+mod ytdlp;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -112,6 +120,7 @@ fn main() -> anyhow::Result<()> {
         }))
         .plugin(tauri_plugin_deep_link::init())
         .manage(st.clone())
+        .manage(Arc::new(remote::RemoteState::load(&st.data_dir, remote::computer_name())))
         .setup(move |app| {
             let handle = app.handle().clone();
 
@@ -133,6 +142,14 @@ fn main() -> anyhow::Result<()> {
                     Err(e) => tracing::debug!("deep_link get_current failed: {e}"),
                 }
             }
+
+            // New-episode watcher (network at most once per 24 h).
+            watcher::spawn_background(handle.clone(), setup_state.clone());
+
+            // "Play on another Mac" LAN server + Bonjour advert (if enabled).
+            remote::spawn(handle.clone(), setup_state.clone());
+            // Mobile-data mode (path monitor + 1 s loop, "net-status" events).
+            netmode::spawn_background(handle.clone(), setup_state.clone());
 
             // 1 s ticker.
             let st = setup_state.clone();
@@ -169,12 +186,16 @@ fn main() -> anyhow::Result<()> {
             metadata::search_media,
             metadata::set_media_match,
             metadata::clear_media_match,
+            metadata::parse_names,
+            metadata::list_episodes,
             // player (WP3)
             player::play_media,
             player::player_current,
             player::get_subtitle_vtt,
             player::open_in_vlc,
             player::open_external,
+            subfetch::fetch_online_subtitles,
+            nextup::next_episode,
             // groups + watched
             groups::list_groups,
             groups::create_group,
@@ -184,6 +205,37 @@ fn main() -> anyhow::Result<()> {
             groups::delete_group,
             groups::get_watched,
             groups::set_watched,
+            // new-episode watcher
+            watcher::watcher_get_settings,
+            watcher::watcher_set_settings,
+            watcher::watcher_check,
+            watcher::watcher_follow,
+            watcher::watcher_unfollow,
+            watcher::watcher_dismiss,
+            // yt-dlp (v2)
+            ytdlp::yt_probe,
+            ytdlp::yt_download,
+            ytdlp::yt_list,
+            ytdlp::yt_cancel,
+            ytdlp::yt_remove,
+            ytdlp::yt_reveal,
+            // remote play (Tide → Tide on the LAN)
+            remote::remote_status,
+            remote::remote_set_enabled,
+            remote::remote_discover,
+            remote::remote_pair_start,
+            remote::remote_add_manual,
+            remote::remote_pair_finish,
+            remote::remote_unpair,
+            remote::remote_play,
+            // mobile-data mode, notifications, cleanup
+            netmode::net_status,
+            netmode::net_set_mode,
+            netmode::net_mark_current,
+            notify::notify_get_settings,
+            notify::notify_set_settings,
+            cleanup::cleanup_candidates,
+            cleanup::cleanup_apply,
         ])
         .run(tauri::generate_context!())?;
 

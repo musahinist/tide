@@ -1,0 +1,151 @@
+/* Video-site downloads (yt-dlp). Rows reuse .torrent/.head/.name/.stats/.bar/.ctl from styles.css. */
+
+#yt-root {
+  flex: none;
+  max-height: 45vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+body.yt-has #yt-root { margin-bottom: 1px; }
+/* The "drop a magnet" hint must not sit on top of video rows. */
+body.yt-has #empty { display: none !important; }
+
+.yt .name { display: flex; align-items: center; gap: 8px; }
+.yt .name > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.yt-badge {
+  flex: none;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(229, 83, 75, .16);
+  color: #e88a84;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: .06em;
+  line-height: 14px;
+}
+.yt.s-paused .stats { color: var(--faint, #5c5c5c); }
+
+/* ---------- modal ---------- */
+.yt-modal {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, .45);
+  animation: yt-in .15s ease;
+  z-index: 15;
+}
+.yt-sheet {
+  width: 360px;
+  max-width: calc(100% - 32px);
+  padding: 18px;
+  border-radius: 12px;
+  background: #2c2c2c;
+  border: 1px solid rgba(255, 255, 255, .08);
+  box-shadow: 0 20px 50px rgba(0, 0, 0, .5);
+  animation: yt-pop .18s ease;
+  color: var(--text, #ddd);
+}
+@keyframes yt-in { from { opacity: 0; } }
+@keyframes yt-pop { from { transform: scale(.96); opacity: 0; } }
+
+.yt-wait { display: flex; align-items: center; gap: 12px; min-height: 40px; }
+.yt-spin {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(255, 255, 255, .15);
+  border-top-color: var(--accent, #2f7ee6);
+  border-radius: 50%;
+  animation: yt-spin .8s linear infinite;
+}
+@keyframes yt-spin { to { transform: rotate(360deg); } }
+.yt-url {
+  margin: 0;
+  min-width: 0;
+  color: var(--muted, #888);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.yt-thumb {
+  position: relative;
+  margin: -4px -4px 12px;
+  aspect-ratio: 16 / 9;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #1a1a1a;
+}
+.yt-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.yt-dur {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, .75);
+  color: #eee;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.yt-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: #f2f2f2;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.yt-meta { margin: 4px 0 0; color: var(--muted, #888); font-size: 12px; }
+.yt-err { margin: 10px 0 0; color: #e0877f; font-size: 12px; overflow-wrap: anywhere; -webkit-user-select: text; user-select: text; }
+.yt-err:empty { display: none; }
+.yt-sheet > .yt-url { margin-top: 6px; }
+
+.yt-presets { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 16px; }
+.yt-presets button, .yt-actions button {
+  height: 30px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 6px;
+  background: #444;
+  color: var(--text, #ddd);
+  font: inherit;
+  transition: filter .15s, opacity .15s;
+}
+.yt-presets button { background: rgba(47, 126, 230, .22); color: #cfe0fa; font-weight: 500; }
+.yt-presets button.audio { background: #444; color: var(--text, #ddd); white-space: nowrap; }
+.yt-presets button:hover:not(:disabled), .yt-actions button:hover { filter: brightness(1.2); }
+.yt-presets button:disabled { opacity: .35; }
+.yt-presets button:focus-visible, .yt-actions button:focus-visible { outline: 2px solid rgba(47, 126, 230, .7); outline-offset: 1px; }
+.yt-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.yt-actions button { min-width: 76px; height: 28px; }
+.yt-actions .danger { background: var(--err, #e5534b); color: #fff; }
+.yt-check { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
+.yt-check input { margin: 0; accent-color: var(--accent, #2f7ee6); }
+
+/* ---------- toast ---------- */
+.yt-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 22px;
+  max-width: calc(100% - 40px);
+  padding: 9px 14px;
+  border-radius: 8px;
+  background: #383838;
+  border: 1px solid rgba(255, 255, 255, .07);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .4);
+  color: var(--text, #ddd);
+  opacity: 0;
+  transform: translate(-50%, 8px);
+  pointer-events: none;
+  transition: opacity .25s ease, transform .25s ease;
+  z-index: 21;
+}
+.yt-toast.show { opacity: 1; transform: translate(-50%, 0); }

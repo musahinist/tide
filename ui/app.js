@@ -20,6 +20,7 @@ const ICONS = {
   resume: '<path d="M8 2.5v9M4 7.5l4 4 4-4M3.5 13.5h9"/>',
   remove: '<path d="M4 4l8 8M12 4l-8 8"/>',
   more: '<path class="fill" d="M3 8a1.2 1.2 0 1 0 2.4 0A1.2 1.2 0 0 0 3 8zm3.8 0a1.2 1.2 0 1 0 2.4 0 1.2 1.2 0 0 0-2.4 0zm3.8 0a1.2 1.2 0 1 0 2.4 0 1.2 1.2 0 0 0-2.4 0z"/>',
+  screen: '<rect x="2" y="3" width="12" height="8" rx="1.2"/><path d="M6 13.5h4M8 11v2.5"/>',
   folder: '<path d="M2 4.5c0-.6.4-1 1-1h3.2l1.5 1.5H13c.6 0 1 .4 1 1v6c0 .6-.4 1-1 1H3c-.6 0-1-.4-1-1z"/>',
 };
 const svg = (name) => `<svg viewBox="0 0 16 16">${ICONS[name]}</svg>`;
@@ -96,6 +97,7 @@ function reportError(e) {
 
 // ---------- adding magnets ----------
 const isMagnet = (s) => /^magnet:/i.test(s) || /^[0-9a-f]{40}$/i.test(s);
+const isWebUrl = (s) => /^https?:\/\//i.test(s.trim());
 
 async function addMagnet(raw) {
   const magnet = raw.trim();
@@ -126,6 +128,7 @@ $('add').addEventListener('submit', async (e) => {
   e.preventDefault();
   const v = $('magnet').value;
   if (!v.trim()) return;
+  if (isWebUrl(v) && window.YT) { closeAdd(); window.YT.openProbeDialog(v.trim()); return; }
   try { await addMagnet(v); closeAdd(); } catch (err) { setAddError(errMsg(err)); }
 });
 
@@ -142,6 +145,7 @@ document.addEventListener('paste', (e) => {
   if (e.target.closest && e.target.closest('input, textarea')) return;
   const text = (e.clipboardData && e.clipboardData.getData('text')) || '';
   e.preventDefault();
+  if (isWebUrl(text) && window.YT) return window.YT.openProbeDialog(text.trim());
   if (!isMagnet(text.trim())) return toast('No magnet link on the clipboard');
   addMagnet(text).catch(reportError);
 });
@@ -183,14 +187,47 @@ function playError(e) {
 const resumeT = (key) => invoke('resume_torrent', { key }).then(refresh, (e) => (errCode(e) === 'COMPLETED' ? refresh() : reportError(e)));
 const pauseT = (key) => invoke('pause_torrent', { key }).then(refresh, reportError);
 
-async function playLargest(key) {
+// Index of the largest video/audio file, or null (after a toast).
+async function largestIdx(key) {
   try {
     const media = (await invoke('list_files', { key })).filter((f) => f.kind === 'video' || f.kind === 'audio');
-    if (!media.length) return toast('No video or audio in this torrent');
+    if (!media.length) { toast('No video or audio in this torrent'); return null; }
     const f = media.reduce((a, b) => (b.size > a.size ? b : a));
     mainFile.set(key, f.index);
-    play(key, f.index);
-  } catch (e) { playError(e); }
+    return f.index;
+  } catch (e) { playError(e); return null; }
+}
+async function playLargest(key) {
+  const idx = await largestIdx(key);
+  if (idx != null) play(key, idx);
+}
+
+// ---------- play on another Mac ----------
+let remote = null; // RemoteStatus
+const onlineDevices = () => ((remote && remote.devices) || []).filter((d) => d.online);
+function remotePlay(dev, key, fileIndex) {
+  invoke('remote_play', { deviceId: dev.id, media: { kind: 'torrent', key, fileIndex } })
+    .then(() => toast(`Playing on ${dev.name}`), reportError);
+}
+// Screen button next to a ▶; `target` resolves to [key, fileIndex] (or null).
+function remoteBtn(target) {
+  const b = iconBtn('screen', 'Play on another Mac', async () => {
+    const devs = onlineDevices();
+    if (!devs.length) return;
+    const go = async (d) => { closeMenu(); const t = await target(); if (t && t[1] != null) remotePlay(d, t[0], t[1]); };
+    if (devs.length === 1) return go(devs[0]);
+    menu.replaceChildren(h('div', 'mhead', 'Play on'), ...devs.map((d) => menuItem(d.name, () => go(d))));
+    menu.hidden = false;
+    const a = b.getBoundingClientRect();
+    menu.style.top = `${Math.min(a.bottom + 4, innerHeight - menu.offsetHeight - 8)}px`;
+    menu.style.left = `${Math.max(8, a.right - menu.offsetWidth)}px`;
+  });
+  b.classList.add('rbtn');
+  b.addEventListener('mouseenter', () => {
+    const devs = onlineDevices();
+    b.title = devs.length === 1 ? `Play on ${devs[0].name}` : 'Play on another Mac';
+  });
+  return b;
 }
 
 // ---------- rows (diffed by key) ----------
@@ -239,7 +276,7 @@ function createRow(key) {
   r.resumeBtn = iconBtn('resume', 'Resume', () => resumeT(key));
   r.revealBtn = iconBtn('folder', 'Show in Finder', () => invoke('reveal_torrent', { key }).catch(reportError));
   r.moreBtn = iconBtn('more', 'More', () => openMenu(r.moreBtn, { key }));
-  ctl.append(r.playBtn, r.pauseBtn, r.resumeBtn, r.revealBtn, iconBtn('remove', 'Remove', () => askRemove(r.last)), r.moreBtn);
+  ctl.append(r.playBtn, remoteBtn(async () => { const i = await largestIdx(key); return [key, i]; }), r.pauseBtn, r.resumeBtn, r.revealBtn, iconBtn('remove', 'Remove', () => askRemove(r.last)), r.moreBtn);
 
   r.art = h('div', 'art');
   r.check = h('button', 'wcheck', '✓');
@@ -259,7 +296,7 @@ function updateRow(r, t) {
   if (r.watched !== w0) { r.watched = w0; r.check.classList.toggle('on', w0); r.check.title = w0 ? 'Watched — click to unmark' : 'Mark as watched'; }
   if (r.name.textContent !== title) r.name.textContent = title;
   if (p.name !== t.name) r.name.title = t.name;
-  const cls = `torrent s-${t.state}${t.key === openKey ? ' open' : ''}${r.group ? ' ep' : ''}`;
+  const cls = `torrent s-${t.state}${t.key === openKey ? ' open' : ''}${r.group ? ' ep' : ''}${r.pack ? ' pack' : ''}`;
   if (r.el.className !== cls) r.el.className = cls;
   const rt = rating(m);
   const line = statsLine(t) + (rt ? ` · IMDb ${rt}` : '');
@@ -278,34 +315,90 @@ function updateRow(r, t) {
 }
 
 // ---------- groups (computed here; the backend only persists groups.json / watched.json) ----------
+// Group identity: show "nodes" per torrent — `title:<norm>` from the offline name parse
+// (instant) and `imdb:<id>` once MediaInfo arrives — unioned into one component. The group
+// id is the component's smallest node, so imdb wins once known; when the id changes, the
+// card (and its expansion) is carried over by member overlap, so nothing flickers.
 let groupsData = { groups: [], excluded: {} };
 let watched = {}; // "key:fileIndex" -> true
 let watchedKeys = new Set(); // torrent keys with any watched file
 const mainFile = new Map(); // key -> index of the main media file (largest video/audio)
 const groupEls = new Map(); // gid -> group card
+const fileEls = new Map(); // "key:fileIndex" -> episode-file row inside a group
 const expanded = new Set(); // gids of expanded group cards (survives re-renders)
 let lastList = [];
 let lastGroups = new Map(); // gid -> { gid, id, name, keys, autoKey }
 
-const code = (s, e) => `S${pad2(s)}E${pad2(e)}`;
-const normTitle = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-function parseSE(name) {
-  const m = /^(.*?)[\s._-]+s(\d{1,2})[\s._-]?e(\d{1,3})/i.exec(name) || /^(.*?)[\s._-]+(\d{1,2})x(\d{2,3})\b/i.exec(name);
-  return m && m[1] ? { show: m[1].replace(/[._]+/g, ' ').trim(), season: +m[2], episode: +m[3] } : null;
+const code = (s, e) => (s == null ? `E${pad2(e)}` : `S${pad2(s)}E${pad2(e)}`);
+
+// Offline name parse (parse_names): torrent name -> { title, norm, year, season, episode, is_tv } | null.
+const parsed = new Map();
+let parseBusy = false;
+function wantParse(list) {
+  if (parseBusy) return;
+  const names = [...new Set(list.map((t) => t.name).filter((n) => !parsed.has(n)))];
+  if (!names.length) return;
+  parseBusy = true;
+  invoke('parse_names', { names })
+    .then((res) => names.forEach((n, i) => parsed.set(n, (res && res[i]) || null)),
+      () => names.forEach((n) => parsed.set(n, null)))
+    .finally(() => { parseBusy = false; render(lastList); });
 }
-// Episode facts for a row: { autoKey, show, season, episode, title } or null.
+
+// Episode files per torrent (list_episodes). ≥ 2 episodes = season pack.
+// key -> { eps, busy, at, tries, next, state }. Live packs refresh every 2 s.
+const packs = new Map();
+function wantEpisodes(t) {
+  if (t.state === 'resolving' || t.id == null) return;
+  let p = packs.get(t.key);
+  if (!p) packs.set(t.key, (p = { eps: null, busy: false, at: 0, tries: 0, next: 0, state: null }));
+  const now = Date.now();
+  if (p.busy || now < p.next) return;
+  const live = t.state === 'downloading' || t.state === 'initializing';
+  if (p.eps && p.state === t.state && !(live && p.eps.length > 1 && now - p.at > 2000)) return;
+  p.busy = true;
+  invoke('list_episodes', { key: t.key }).then((eps) => {
+    const before = p.eps ? p.eps.map((e) => e.file_index).join() : null;
+    Object.assign(p, { eps: eps || [], state: t.state, at: Date.now(), tries: 0 });
+    if (before !== p.eps.map((e) => e.file_index).join()) render(lastList);
+  }, (e) => {
+    p.tries++;
+    p.next = Date.now() + (errCode(e) === 'NOT_FOUND' ? 60e3 : Math.min(60e3, 3e3 * 2 ** (p.tries - 1)));
+  }).finally(() => { p.busy = false; });
+}
+const packOf = (key) => { const p = packs.get(key); return p && p.eps && p.eps.length > 1 ? p.eps : null; };
+
+// Show nodes of a torrent (null = not a show episode).
+function showNodes(t) {
+  const m = infoOf(t.key);
+  if (matched(m) && m.media_type !== 'tv') return null;
+  const nodes = [];
+  if (matched(m) && m.imdb_id) nodes.push(`imdb:${m.imdb_id}`);
+  const p = parsed.get(t.name);
+  if (p && p.is_tv && p.norm && (p.season != null || p.episode != null)) nodes.push(`title:${p.norm}`);
+  const eps = packOf(t.key);
+  if (eps && eps[0].norm) nodes.push(`title:${eps[0].norm}`);
+  return nodes.length ? [...new Set(nodes)] : null;
+}
+function showName(t) {
+  const m = infoOf(t.key);
+  if (matched(m)) return m.title;
+  const p = parsed.get(t.name);
+  if (p && p.title) return p.title;
+  const eps = packOf(t.key);
+  return eps ? eps[0].title_hint : t.name;
+}
+// Episode facts for a single-episode torrent: { season, episode, title }.
 function epInfo(t) {
   const m = infoOf(t.key);
-  if (matched(m) && m.media_type === 'tv') {
-    return { autoKey: m.imdb_id ? `imdb:${m.imdb_id}` : null, show: m.title, season: m.season, episode: m.episode, title: m.episode_title };
-  }
-  const p = parseSE(t.name);
-  if (!p) return null;
-  return { autoKey: matched(m) ? null : `title:${normTitle(p.show)}`, show: p.show, season: p.season, episode: p.episode, title: null };
+  if (matched(m) && m.media_type === 'tv') return { season: m.season, episode: m.episode, title: m.episode_title };
+  const p = parsed.get(t.name);
+  return p && p.is_tv ? { season: p.season, episode: p.episode, title: null } : {};
 }
 function episodeTitle(t) {
+  if (packOf(t.key)) return t.name;
   const e = epInfo(t);
-  if (!e || e.season == null || e.episode == null) return t.name;
+  if (e.episode == null) return t.name;
   return e.title ? `${code(e.season, e.episode)} · ${e.title}` : code(e.season, e.episode);
 }
 
@@ -314,56 +407,93 @@ const playable = (t) => t.id != null && !['resolving', 'initializing', 'error'].
 
 function computeGroups(list) {
   const byKey = new Map(list.map((t) => [t.key, t]));
+  // Union-find over show nodes; root = smallest node ("imdb:" sorts before "title:").
+  const parent = new Map();
+  const find = (x) => { while (parent.get(x) !== x) { parent.set(x, parent.get(parent.get(x))); x = parent.get(x); } return x; };
+  const union = (a, b) => { a = find(a); b = find(b); if (a !== b) { if (a < b) parent.set(b, a); else parent.set(a, b); } };
+  const nodesOf = new Map();
+  for (const t of list) {
+    const n = showNodes(t);
+    if (!n) continue;
+    nodesOf.set(t.key, n);
+    n.forEach((x) => { if (!parent.has(x)) parent.set(x, x); });
+    n.slice(1).forEach((x) => union(n[0], x));
+  }
+  const showKey = (key) => (nodesOf.has(key) ? find(nodesOf.get(key)[0]) : null);
+  const weight = (key) => (packOf(key) || [0]).length;
+
   const out = new Map();
   const owner = new Map();
-  const autoInto = new Map(); // auto key -> manual gid that already holds an episode of that show
+  const autoInto = new Map(); // show key -> manual gid that already holds an episode of that show
   for (const g of groupsData.groups) {
     const gid = `g:${g.id}`;
     out.set(gid, { gid, id: g.id, name: g.name, keys: [] });
-    if (g.auto_key) autoInto.set(g.auto_key, gid);
+    if (g.auto_key) autoInto.set(parent.has(g.auto_key) ? find(g.auto_key) : g.auto_key, gid);
     for (const k of g.members) {
-      const t = byKey.get(k);
-      if (!t || owner.has(k)) continue;
+      if (!byKey.has(k) || owner.has(k)) continue;
       owner.set(k, gid);
-      const e = epInfo(t);
-      if (e && e.autoKey && !autoInto.has(e.autoKey)) autoInto.set(e.autoKey, gid);
+      const sk = showKey(k);
+      if (sk && !autoInto.has(sk)) autoInto.set(sk, gid);
     }
   }
   const autos = new Map();
   for (const t of list) {
     if (owner.has(t.key) || groupsData.excluded[t.key]) continue;
-    const e = epInfo(t);
-    if (!e || !e.autoKey) continue;
-    if (!autos.has(e.autoKey)) autos.set(e.autoKey, { name: e.show, keys: [] });
-    autos.get(e.autoKey).keys.push(t.key);
+    const sk = showKey(t.key);
+    if (!sk) continue;
+    if (!autos.has(sk)) autos.set(sk, { name: null, keys: [], eps: 0 });
+    const a = autos.get(sk);
+    a.keys.push(t.key);
+    a.eps += weight(t.key);
+    if (!a.name || matched(infoOf(t.key))) a.name = showName(t);
   }
-  for (const [ak, a] of autos) {
-    const into = autoInto.get(ak);
+  for (const [sk, a] of autos) {
+    const into = autoInto.get(sk);
     if (into) { a.keys.forEach((k) => owner.set(k, into)); continue; }
-    if (a.keys.length < 2) continue;
-    const gid = `a:${ak}`;
-    out.set(gid, { gid, id: null, name: a.name, keys: [], autoKey: ak });
+    if (a.eps < 2) continue;
+    const gid = `a:${sk}`;
+    out.set(gid, { gid, id: null, name: a.name, keys: [], autoKey: sk });
     a.keys.forEach((k) => owner.set(k, gid));
   }
   for (const t of list) { const g = owner.get(t.key); if (g) out.get(g).keys.push(t.key); }
   return { groups: out, owner };
 }
 
+// A group whose id changed (name -> imdb, merge) keeps its card and expansion.
+function carryOver(groups) {
+  for (const [gid, gr] of groups) {
+    if (groupEls.has(gid)) continue;
+    for (const [old, G] of groupEls) {
+      if (groups.has(old) || !gr.keys.some((k) => G.keys.includes(k))) continue;
+      groupEls.delete(old);
+      G.gid = gid;
+      groupEls.set(gid, G);
+      if (expanded.delete(old)) expanded.add(gid);
+      break;
+    }
+  }
+}
+
 function render(list) {
   lastList = list;
+  wantParse(list);
+  for (const t of list) wantEpisodes(t);
   const { groups, owner } = computeGroups(list);
   lastGroups = groups;
+  carryOver(groups);
   const seen = new Set();
   for (const t of list) {
     seen.add(t.key);
     let r = rows.get(t.key);
     if (!r) { r = createRow(t.key); rows.set(t.key, r); }
     r.group = owner.get(t.key) || null;
+    r.pack = !!(r.group && packOf(t.key));
     updateRow(r, t);
   }
   const container = $('list');
   const seenG = new Set();
-  let prev = null;
+  const seenF = new Set();
+  let prev = cwEl; // "Continue watching" stays first
   const place = (el) => {
     const want = prev ? prev.nextSibling : container.firstChild;
     if (want !== el) container.insertBefore(el, want);
@@ -376,24 +506,27 @@ function render(list) {
     seenG.add(r.group);
     let G = groupEls.get(r.group);
     if (!G) { G = createGroup(r.group); groupEls.set(r.group, G); }
-    updateGroup(G, groups.get(r.group));
+    updateGroup(G, groups.get(r.group), seenF);
     place(G.el);
   }
   for (const [key, r] of rows) {
     if (!seen.has(key)) {
-      r.el.remove(); rows.delete(key); art.delete(key); meta.delete(key);
+      r.el.remove(); rows.delete(key); art.delete(key); meta.delete(key); packs.delete(key);
       if (openKey === key) openKey = null;
     }
   }
   for (const [gid, G] of groupEls) if (!seenG.has(gid)) { G.el.remove(); groupEls.delete(gid); }
+  for (const [fk, F] of fileEls) if (!seenF.has(fk)) { F.el.remove(); fileEls.delete(fk); }
   pumpArtwork();
   pumpMeta();
   $('empty').hidden = list.length > 0;
   if (openKey) updatePanel(openKey);
+  renderContinue();
+  if (view === 'library') renderLibrary();
 }
 
 function createGroup(gid) {
-  const G = { gid, el: h('section', 'torrent group'), head: h('div', 'head'), name: h('div', 'name'), seasons: new Map() };
+  const G = { gid, keys: [], el: h('section', 'torrent group'), head: h('div', 'head'), name: h('div', 'name'), seasons: new Map() };
   const stats = h('div', 'stats');
   G.statsText = h('span');
   stats.append(h('span', 'dot'), G.statsText);
@@ -404,13 +537,18 @@ function createGroup(gid) {
   const ctl = h('div', 'gctl');
   G.nextBtn = h('button', 'gnext');
   G.nextBtn.type = 'button';
-  G.nextBtn.addEventListener('click', (e) => { e.stopPropagation(); if (G.nextKey) playLargest(G.nextKey); });
-  const more = iconBtn('more', 'More', () => openMenu(more, { gid }));
+  G.nextBtn.addEventListener('click', (e) => { e.stopPropagation(); if (G.next) playItem(G.next); });
+  const more = iconBtn('more', 'More', () => openMenu(more, { gid: G.gid }));
   more.classList.add('gmore');
-  ctl.append(G.nextBtn, more);
+  const gRemote = remoteBtn(async () => {
+    const x = G.next;
+    if (!x) return null;
+    return [x.key, x.f ? x.f.file_index : await largestIdx(x.key)];
+  });
+  ctl.append(G.nextBtn, gRemote, more);
   G.head.append(G.art, G.name, stats, ctl, bar);
   G.head.addEventListener('click', () => {
-    if (expanded.has(gid)) expanded.delete(gid); else expanded.add(gid);
+    if (expanded.has(G.gid)) expanded.delete(G.gid); else expanded.add(G.gid);
     render(lastList);
   });
   G.eps = h('div', 'eps');
@@ -418,19 +556,65 @@ function createGroup(gid) {
   return G;
 }
 
-function updateGroup(G, gr) {
-  const items = gr.keys.map((k) => ({ r: rows.get(k), t: rows.get(k).last, e: epInfo(rows.get(k).last) || {} }));
+// Episode-file row (one file of a season pack).
+function createFileRow(key, idx) {
+  const F = { el: h('section', 'torrent ep efile'), head: h('div', 'head'), name: h('div', 'name'), statsText: h('span'), fill: h('i') };
+  const stats = h('div', 'stats');
+  stats.append(h('span', 'dot'), F.statsText);
+  const bar = h('div', 'bar');
+  bar.append(F.fill);
+  F.check = h('button', 'wcheck', '✓');
+  F.check.type = 'button';
+  F.check.addEventListener('click', (e) => { e.stopPropagation(); toggleFileWatched(key, idx); });
+  const ctl = h('div', 'ctl');
+  F.playBtn = iconBtn('play', 'Play', () => play(key, idx));
+  ctl.append(F.playBtn, remoteBtn(() => [key, idx]));
+  F.head.append(F.check, F.name, stats, ctl, bar);
+  F.el.append(F.head);
+  return F;
+}
+function updateFileRow(F, x) {
+  const { t, f, key } = x;
+  const name = code(f.season, f.episode);
+  if (F.name.textContent !== name) F.name.textContent = name;
+  const done = f.progress >= 1;
+  const line = done ? bytes(f.size) : `${pct(f.progress)} · ${bytes(f.size)}`;
+  if (F.statsText.textContent !== line) F.statsText.textContent = line;
+  const w = `${(f.progress * 100).toFixed(2)}%`;
+  if (F.fill.style.width !== w) F.fill.style.width = w;
+  const cls = `torrent ep efile s-${done ? 'completed' : t.state}`;
+  if (F.el.className !== cls) F.el.className = cls;
+  const on = !!watched[`${key}:${f.file_index}`];
+  if (F.watched !== on) { F.watched = on; F.check.classList.toggle('on', on); F.check.title = on ? 'Watched — click to unmark' : 'Mark as watched'; }
+  F.playBtn.hidden = !playable(t);
+}
+
+const itemWatched = (x) => (x.f ? !!watched[`${x.key}:${x.f.file_index}`] : isWatched(x.key));
+const playItem = (x) => (x.f ? play(x.key, x.f.file_index) : playLargest(x.key));
+
+function updateGroup(G, gr, seenF) {
+  G.keys = gr.keys;
+  // Items: one per single-episode torrent, one per episode file of a pack.
+  const items = [];
+  const packRows = [];
+  for (const k of gr.keys) {
+    const r = rows.get(k), t = r.last, eps = packOf(k);
+    if (!eps) { items.push({ key: k, t, r, e: epInfo(t) }); continue; }
+    packRows.push(r);
+    for (const f of eps) items.push({ key: k, t, f, e: { season: f.season, episode: f.episode } });
+  }
   const num = (v) => (v == null ? 1e9 : v);
   items.sort((a, b) => num(a.e.season) - num(b.e.season) || num(a.e.episode) - num(b.e.episode) || a.t.name.localeCompare(b.t.name));
-  const first = items.find((x) => x.e.season != null && x.e.episode != null);
-  const last = [...items].reverse().find((x) => x.e.season != null && x.e.episode != null);
+  const withEp = items.filter((x) => x.e.episode != null);
+  const first = withEp[0], last = withEp[withEp.length - 1];
   let name = gr.name;
-  if (!gr.id) { const m = items.map((x) => infoOf(x.t.key)).find(matched); if (m) name = m.title; }
+  if (!gr.id) { const m = gr.keys.map(infoOf).find(matched); if (m) name = m.title; }
   if (G.name.textContent !== name) G.name.textContent = name;
 
   let total = 0, done = 0, down = 0;
-  for (const { t } of items) { total += t.total_bytes; done += t.progress_bytes; down += t.down_bps; }
-  const allDone = items.every((x) => x.t.state === 'completed');
+  const ts = gr.keys.map((k) => rows.get(k).last);
+  for (const t of ts) { total += t.total_bytes; done += t.progress_bytes; down += t.down_bps; }
+  const allDone = ts.every((t) => t.state === 'completed');
   const parts = [plural(items.length, 'episode')];
   if (first) parts.push(first === last ? code(first.e.season, first.e.episode) : `${code(first.e.season, first.e.episode)}–${code(last.e.season, last.e.episode)}`);
   parts.push(bytes(total));
@@ -440,19 +624,19 @@ function updateGroup(G, gr) {
   if (G.statsText.textContent !== line) G.statsText.textContent = line;
   const w = `${(total ? (done / total) * 100 : 0).toFixed(2)}%`;
   if (G.fill.style.width !== w) G.fill.style.width = w;
-  const st = allDone ? 'completed' : items.some((x) => x.t.state === 'downloading') ? 'downloading' : items.some((x) => x.t.state === 'error') ? 'error' : 'paused';
+  const st = allDone ? 'completed' : ts.some((t) => t.state === 'downloading') ? 'downloading' : ts.some((t) => t.state === 'error') ? 'error' : 'paused';
   const open = expanded.has(G.gid);
   const cls = `torrent group s-${st}${open ? ' expanded' : ''}`;
   if (G.el.className !== cls) G.el.className = cls;
 
-  const next = items.find((x) => playable(x.t) && !isWatched(x.t.key)) || items.find((x) => playable(x.t));
-  G.nextKey = next ? next.t.key : null;
-  const label = next ? `▶ ${next.e.season != null && next.e.episode != null ? code(next.e.season, next.e.episode) : 'Play'}` : '';
+  const next = items.find((x) => playable(x.t) && !itemWatched(x)) || items.find((x) => playable(x.t));
+  G.next = next || null;
+  const label = next ? `▶ ${next.e.episode != null ? code(next.e.season, next.e.episode) : 'Play'}` : '';
   if (G.nextBtn.textContent !== label) G.nextBtn.textContent = label;
   G.nextBtn.hidden = !next;
 
-  const withArt = items.find((x) => x.r.artUrl);
-  const url = withArt ? withArt.r.artUrl : null;
+  const withArt = gr.keys.map((k) => rows.get(k)).find((r) => r.artUrl);
+  const url = withArt ? withArt.artUrl : null;
   if (url && G.artUrl !== url) {
     G.artUrl = url;
     G.art.style.backgroundImage = `url("${url}")`;
@@ -467,20 +651,33 @@ function updateGroup(G, gr) {
     requestAnimationFrame(() => requestAnimationFrame(() => G.head.classList.add('art-on')));
   }
 
-  // Episode list: season headers + the rows themselves (kept inside even when collapsed).
+  // Episode list: season headers + episode rows, then the pack torrents themselves
+  // (for pause / remove / details). Kept inside even when collapsed.
   G.eps.hidden = !open;
   const want = [];
+  const header = (label) => {
+    if (!G.seasons.has(label)) G.seasons.set(label, h('div', 'season', label));
+    want.push(G.seasons.get(label));
+  };
   const seasons = new Set(items.map((x) => x.e.season));
   const showHeaders = seasons.size > 1 || !seasons.has(undefined);
-  let cur;
+  let cur = {};
   for (const x of items) {
     if (showHeaders && x.e.season !== cur) {
       cur = x.e.season;
-      const label = cur == null ? 'Other' : cur === 0 ? 'Specials' : `Season ${cur}`;
-      if (!G.seasons.has(label)) G.seasons.set(label, h('div', 'season', label));
-      want.push(G.seasons.get(label));
+      header(cur == null ? 'Other' : cur === 0 ? 'Specials' : `Season ${cur}`);
     }
-    want.push(x.r.el);
+    if (!x.f) { want.push(x.r.el); continue; }
+    const fk = `${x.key}:${x.f.file_index}`;
+    let F = fileEls.get(fk);
+    if (!F) { F = createFileRow(x.key, x.f.file_index); fileEls.set(fk, F); }
+    seenF.add(fk);
+    updateFileRow(F, x);
+    want.push(F.el);
+  }
+  if (packRows.length) {
+    header(packRows.length === 1 ? 'Season pack' : 'Season packs');
+    packRows.forEach((r) => want.push(r.el));
   }
   want.forEach((el, i) => { if (G.eps.children[i] !== el) G.eps.insertBefore(el, G.eps.children[i] || null); });
   while (G.eps.children.length > want.length) G.eps.lastChild.remove();
@@ -504,6 +701,9 @@ async function mainIndex(key) {
   const idx = media.reduce((a, b) => (b.size > a.size ? b : a)).index;
   mainFile.set(key, idx);
   return idx;
+}
+function toggleFileWatched(key, fileIndex) {
+  invoke('set_watched', { key, fileIndex, watched: !watched[`${key}:${fileIndex}`] }).then(reloadWatched, reportError);
 }
 async function toggleWatched(key) {
   try {
@@ -592,6 +792,8 @@ function openMenu(anchor, ctx) {
       ? invoke('rename_group', { id: gr.id, name })
       : invoke('create_group', { name, keys: gr.keys })))));
     items.push(menuItem('Ungroup', () => { closeMenu(); act(ungroup(gr)); }));
+    const fol = followItem(gr);
+    if (fol) items.push(fol);
   }
   menu.replaceChildren(...items);
   menu.hidden = false;
@@ -740,6 +942,7 @@ function closePanel() {
   const r = openKey && rows.get(openKey);
   if (r) { r.el.classList.remove('open'); if (r.panel) r.panel.el.remove(); r.panel = null; }
   openKey = null;
+  document.body.classList.remove('sheet-open');
 }
 
 function linkBtn(text, cls, onClick) {
@@ -949,10 +1152,572 @@ function fileRow(key, f) {
   const media = f.kind === 'video' || f.kind === 'audio';
   row.append(name, h('span', 'fsize', bytes(f.size)), row._pct,
     media ? iconBtn('play', 'Play', () => play(key, f.index)) : h('span', 'nop'));
+  if (media) row.append(remoteBtn(() => [key, f.index]));
   return row;
 }
 
 function refresh() { invoke('list_torrents').then(render, reportError); }
+
+// ---------- new-episode watcher ----------
+// Banner above the list for aired episodes newer than what's in Tide; search results come
+// only from the user's own Torznab endpoint (Prowlarr / Jackett). Gear = settings popover.
+ICONS.gear = '<circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v1.6M8 12.6v1.6M1.8 8h1.6M12.6 8h1.6M3.6 3.6l1.1 1.1M11.3 11.3l1.1 1.1M3.6 12.4l1.1-1.1M11.3 4.7l1.1-1.1"/>';
+let wSettings = { torznab_url: '', api_key: '', auto_add: false, quality: '1080p', unfollowed: [], last_check: 0 };
+let wEpisodes = [];
+const wBanner = h('div', 'wbanner');
+wBanner.hidden = true;
+$('list').before(wBanner);
+const wGear = iconBtn('gear', 'Settings', () => (wPop.hidden ? openWatcherSettings() : closeWatcherSettings()));
+wGear.id = 'wgear';
+$('plus').before(wGear);
+
+const epCode = (n) => `S${pad2(n.season)}E${pad2(n.episode)}`;
+const resultLine = (r) => [r.quality, r.size ? bytes(r.size) : null, `${r.seeders} seed${r.seeders === 1 ? '' : 's'}`].filter(Boolean).join(' · ');
+const wSearchOn = () => !!(wSettings.torznab_url || '').trim();
+
+function setEpisodes(list) { wEpisodes = Array.isArray(list) ? list : []; renderBanner(); }
+function dismissEpisode(n) {
+  wEpisodes = wEpisodes.filter((x) => x !== n);
+  renderBanner();
+  invoke('watcher_dismiss', { imdbId: n.imdb_id, season: n.season, episode: n.episode }).catch(reportError);
+}
+async function addResult(n, r) {
+  closeMenu();
+  try {
+    await addMagnet(r.magnet);
+    toast(`Added ${n.show} ${epCode(n)}`);
+    dismissEpisode(n);
+  } catch (e) { reportError(e); }
+}
+
+function renderBanner() {
+  const shown = wEpisodes.slice(0, 3);
+  wBanner.hidden = !shown.length;
+  wBanner.replaceChildren(...shown.map((n) => {
+    const line = h('div', 'wline');
+    const what = h('span', 'wwhat');
+    what.append(h('b', null, `${n.show} ${epCode(n)}`), document.createTextNode(' is out'));
+    if (n.episode_title) what.title = n.episode_title;
+    line.append(h('span', 'wdot'), what);
+    const best = n.results && n.results[0];
+    if (best) {
+      const chip = h('span', 'wchip');
+      chip.title = best.title;
+      const add = h('button', 'wadd', 'Add');
+      add.type = 'button';
+      add.addEventListener('click', () => addResult(n, best));
+      chip.append(h('span', null, resultLine(best)), add);
+      line.append(chip);
+      if (n.results.length > 1) {
+        const more = h('button', 'wlink', 'more ▾');
+        more.type = 'button';
+        more.addEventListener('click', (e) => { e.stopPropagation(); openResults(more, n); });
+        line.append(more);
+      }
+    } else if (!wSearchOn()) {
+      const setup = h('button', 'wlink', 'Set up search');
+      setup.type = 'button';
+      setup.addEventListener('click', (e) => { e.stopPropagation(); openWatcherSettings(); });
+      line.append(setup);
+    } else {
+      line.append(h('span', 'wmuted', 'no results yet'));
+    }
+    const x = h('button', 'wx', '×');
+    x.type = 'button';
+    x.title = 'Dismiss';
+    x.addEventListener('click', () => dismissEpisode(n));
+    line.append(x);
+    return line;
+  }));
+  if (wEpisodes.length > 3) wBanner.append(h('div', 'wline wmore', `+${wEpisodes.length - 3} more`));
+}
+
+function openResults(anchor, n) {
+  const items = n.results.slice(1).map((r) => {
+    const b = menuItem(resultLine(r), () => addResult(n, r));
+    b.title = r.title;
+    return b;
+  });
+  menuCtx = { results: n };
+  menu.replaceChildren(...items);
+  menu.hidden = false;
+  const a = anchor.getBoundingClientRect();
+  menu.style.top = `${a.bottom + 4}px`;
+  menu.style.left = `${Math.min(a.left, innerWidth - menu.offsetWidth - 8)}px`;
+}
+
+// Settings popover.
+const wPop = h('form', 'wpop');
+wPop.hidden = true;
+wPop.autocomplete = 'off';
+wPop.spellcheck = false;
+const wField = (label, input) => { const l = h('label', 'wfield'); l.append(h('span', null, label), input); return l; };
+const wUrl = h('input'); wUrl.type = 'text'; wUrl.placeholder = 'http://localhost:9696/1/';
+const wKey = h('input'); wKey.type = 'password'; wKey.placeholder = 'API key';
+const wQual = h('select');
+[['1080p', '1080p'], ['720p', '720p'], ['any', 'Any quality']].forEach(([v, t]) => { const o = h('option', null, t); o.value = v; wQual.append(o); });
+const wAuto = h('input'); wAuto.type = 'checkbox';
+const wAutoL = h('label', 'check'); wAutoL.append(wAuto, document.createTextNode(' Auto-add best result'));
+const wStatus = h('p', 'wstatus');
+const wSave = h('button', 'wprimary', 'Save'); wSave.type = 'submit';
+const wCheck = h('button', null, 'Check now'); wCheck.type = 'button';
+const wActs = h('div', 'actions'); wActs.append(wCheck, wSave);
+wPop.append(h('p', 'title', 'New episodes'), h('p', 'whint', 'Search uses your own Torznab feed (Prowlarr or Jackett). Leave empty to only get notified.'),
+  wField('Torznab URL', wUrl), wField('API key', wKey), wField('Quality', wQual), wAutoL, wStatus, wActs);
+document.body.append(wPop);
+
+function fillWatcherForm() {
+  wUrl.value = wSettings.torznab_url || '';
+  wKey.value = wSettings.api_key || '';
+  wQual.value = wSettings.quality || '1080p';
+  wAuto.checked = !!wSettings.auto_add;
+  wStatus.textContent = wSettings.last_check ? `Last checked ${new Date(wSettings.last_check * 1000).toLocaleString()}` : '';
+  wStatus.className = 'wstatus';
+}
+function openWatcherSettings() {
+  closeMenu();
+  fillWatcherForm();
+  wPop.hidden = false;
+  const a = wGear.getBoundingClientRect();
+  wPop.style.top = `${a.bottom + 6}px`;
+  wPop.style.right = `${Math.max(8, innerWidth - a.right - 8)}px`;
+  wUrl.focus();
+}
+function closeWatcherSettings() { wPop.hidden = true; }
+const wSay = (msg, bad) => { wStatus.textContent = msg; wStatus.className = `wstatus${bad ? ' bad' : ''}`; };
+document.addEventListener('mousedown', (e) => { if (!wPop.hidden && !wPop.contains(e.target) && !wGear.contains(e.target)) closeWatcherSettings(); });
+wPop.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.stopPropagation(); closeWatcherSettings(); } });
+wPop.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  wSave.disabled = true;
+  wSay(wUrl.value.trim() ? 'Checking the feed…' : 'Saving…');
+  try {
+    wSettings = await invoke('watcher_set_settings', { torznabUrl: wUrl.value.trim(), apiKey: wKey.value.trim(), autoAdd: wAuto.checked, quality: wQual.value });
+    wSay('Saved');
+    renderBanner();
+  } catch (err) { wSay(errMsg(err), true); }
+  wSave.disabled = false;
+});
+wCheck.addEventListener('click', async () => {
+  wCheck.disabled = true;
+  wSay('Checking…');
+  try {
+    setEpisodes(await invoke('watcher_check', { force: true }));
+    wSay(wEpisodes.length ? `${plural(wEpisodes.length, 'new episode')}` : 'Up to date');
+    loadWatcher();
+  } catch (err) { wSay(errMsg(err), true); }
+  wCheck.disabled = false;
+});
+
+function loadWatcher() {
+  return invoke('watcher_get_settings').then((s) => { if (s) { wSettings = s; renderBanner(); } }, () => {});
+}
+
+// ---------- more settings (mobile data, notifications, cleanup) in the same popover ----------
+let net = null; // NetStatus
+const nBanner = h('div', 'nbanner');
+nBanner.hidden = true;
+$('list').before(nBanner);
+const sSection = (title) => { const s = h('div', 'wsec'); s.append(h('p', 'title', title)); return s; };
+const nLine = h('p', 'whint');
+const nMode = h('select');
+[['pause', 'Pause downloads'], ['limit', 'Limit speed'], ['off', 'Off']].forEach(([v, t]) => { const o = h('option', null, t); o.value = v; nMode.append(o); });
+const nKbps = h('input'); nKbps.type = 'number'; nKbps.min = '1'; nKbps.className = 'nkbps'; nKbps.title = 'KB/s';
+const nModeRow = h('div', 'nrow'); nModeRow.append(nMode, nKbps, h('span', 'wmuted', 'KB/s'));
+const nMark = h('input'); nMark.type = 'checkbox';
+const nMarkL = h('label', 'check'); nMarkL.append(nMark, document.createTextNode(' Treat this network as mobile data'));
+const nAuto = h('button', 'wlink', 'auto'); nAuto.type = 'button'; nAuto.title = 'Back to automatic detection';
+const nMarkRow = h('div', 'nrow'); nMarkRow.append(nMarkL, nAuto);
+const netSec = sSection('Mobile data'); netSec.append(nLine, nModeRow, nMarkRow);
+const nfOn = h('input'); nfOn.type = 'checkbox';
+const nfL = h('label', 'check'); nfL.append(nfOn, document.createTextNode(' Notify when downloads finish'));
+const nfSec = sSection('Notifications'); nfSec.append(nfL);
+const cBtn = h('button', null, 'Free up space…'); cBtn.type = 'button';
+const cSec = sSection('Storage'); cSec.append(h('p', 'whint', 'Delete watched downloads older than 30 days.'), cBtn);
+wPop.append(netSec, nfSec, cSec);
+
+function renderNet() {
+  const s = net;
+  if (!s) return;
+  const paused = (s.paused_by_netmode || []).length;
+  const where = !s.detected ? 'Detecting network…' : `This network: ${s.metered ? 'metered' : 'not metered'}${s.ssid ? ` (${s.ssid})` : ''}`;
+  nLine.textContent = s.metered && paused ? `${where} · ${plural(paused, 'download')} paused` : where;
+  if (document.activeElement !== nMode) nMode.value = s.mode;
+  if (document.activeElement !== nKbps) nKbps.value = s.limit_kbps;
+  nKbps.hidden = s.mode !== 'limit';
+  nModeRow.lastChild.hidden = s.mode !== 'limit';
+  nMark.checked = s.manual != null ? s.manual : !!s.metered;
+  nAuto.hidden = s.manual == null;
+  nBanner.hidden = !(s.metered && s.mode === 'pause' && paused);
+  if (!nBanner.hidden) {
+    const go = h('button', 'wlink', 'Resume anyway');
+    go.type = 'button';
+    go.addEventListener('click', () => setNet('net_set_mode', { mode: 'off' }));
+    const line = h('div', 'wline');
+    line.append(h('span', 'wmuted', `On mobile data — ${plural(paused, 'download')} paused`), go);
+    nBanner.replaceChildren(line);
+  }
+}
+const setNet = (cmd, args) => invoke(cmd, args).then((s) => { net = s; renderNet(); refresh(); }, reportError);
+nMode.addEventListener('change', () => setNet('net_set_mode', { mode: nMode.value, limitKbps: Math.max(1, Number(nKbps.value) || 200) }));
+nKbps.addEventListener('change', () => setNet('net_set_mode', { mode: nMode.value, limitKbps: Math.max(1, Number(nKbps.value) || 200) }));
+nMark.addEventListener('change', () => setNet('net_mark_current', { metered: nMark.checked }));
+nAuto.addEventListener('click', () => setNet('net_mark_current', { metered: null }));
+nfOn.addEventListener('change', () => invoke('notify_set_settings', { enabled: nfOn.checked }).then((s) => { nfOn.checked = !!s.enabled; }, reportError));
+function loadMoreSettings() {
+  invoke('net_status').then((s) => { net = s; renderNet(); }, () => {});
+  invoke('notify_get_settings').then((s) => { nfOn.checked = !!(s && s.enabled); }, () => {});
+}
+wGear.addEventListener('click', () => { if (!wPop.hidden) loadMoreSettings(); });
+
+// Cleanup sheet.
+const cSheet = h('div', 'wpop csheet');
+cSheet.hidden = true;
+document.body.append(cSheet);
+document.addEventListener('mousedown', (e) => { if (!cSheet.hidden && !cSheet.contains(e.target)) cSheet.hidden = true; });
+cSheet.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.stopPropagation(); cSheet.hidden = true; } });
+function ageOf(t) {
+  if (!t) return '';
+  const d = Math.floor((Date.now() / 1000 - t) / 86400);
+  return d < 1 ? 'today' : d < 60 ? `${d} days ago` : `${Math.round(d / 30)} months ago`;
+}
+cBtn.addEventListener('click', async () => {
+  let list;
+  try { list = await invoke('cleanup_candidates', {}); } catch (e) { return reportError(e); }
+  closeWatcherSettings();
+  const items = (list && list.items) || [];
+  const boxes = [];
+  const go = h('button', 'wprimary'); go.type = 'button';
+  const cancel = h('button', null, 'Cancel'); cancel.type = 'button';
+  const sum = () => {
+    const sel = items.filter((_, i) => boxes[i].checked);
+    go.textContent = `Delete ${plural(sel.length, 'item')} (${bytes(sel.reduce((a, c) => a + c.size, 0))})`;
+    go.disabled = !sel.length;
+    return sel;
+  };
+  const rowsEl = h('div', 'clist');
+  items.forEach((c, i) => {
+    const l = h('label', 'crow');
+    const b = h('input'); b.type = 'checkbox'; b.checked = true; b.addEventListener('change', sum);
+    boxes.push(b);
+    const name = h('span', 'cname', c.name); name.title = c.name;
+    l.append(b, name, h('span', 'wmuted', `${bytes(c.size)} · ${ageOf(c.completed_at)}`));
+    rowsEl.append(l);
+  });
+  const acts = h('div', 'actions'); acts.append(cancel, go);
+  cSheet.replaceChildren(h('p', 'title', 'Free up space'),
+    items.length ? rowsEl : h('p', 'whint', 'Nothing to clean up — no watched downloads older than 30 days.'), acts);
+  if (!items.length) go.hidden = true;
+  sum();
+  cancel.addEventListener('click', () => { cSheet.hidden = true; });
+  go.addEventListener('click', async () => {
+    go.disabled = true;
+    try {
+      const r = await invoke('cleanup_apply', { items: sum().map((c) => ({ key: c.key, fileIndex: c.file_index })) });
+      cSheet.hidden = true;
+      const skip = (r.skipped || []).map((s) => s.reason);
+      toast(`Freed ${bytes(r.freed_bytes || 0)}${skip.length ? ` · ${skip.length} skipped: ${[...new Set(skip)].join(', ')}` : ''}`);
+      refresh();
+      reloadWatched();
+    } catch (e) { go.disabled = false; reportError(e); }
+  });
+  cSheet.hidden = false;
+});
+// IMDb id of a group's series (for Follow / Unfollow), if matched.
+function groupSeries(gr) {
+  const m = gr.keys.map(infoOf).find((i) => matched(i) && i.media_type === 'tv' && i.imdb_id);
+  return m ? m.imdb_id : null;
+}
+function followItem(gr) {
+  const tt = groupSeries(gr);
+  if (!tt) return null;
+  const off = (wSettings.unfollowed || []).includes(tt);
+  return menuItem(off ? 'Follow' : 'Unfollow', () => {
+    closeMenu();
+    invoke(off ? 'watcher_follow' : 'watcher_unfollow', { imdbId: tt }).then(() => {
+      if (!off) setEpisodes(wEpisodes.filter((n) => n.imdb_id !== tt));
+      toast(off ? 'Following new episodes' : 'No longer following');
+      return loadWatcher();
+    }, reportError);
+  });
+}
+
+// ---------- continue watching ----------
+// Source: the player's "tide:resume:<key>:<fileIndex>" = seconds entries. The player window
+// is served from the same app origin, so it shares this localStorage (scanResume relies on
+// that too). No duration is stored, so the bar uses the matched runtime when known.
+// Order: most recently changed first — change times are tracked here ("tide:cwAt").
+const CW_MAX = 6;
+const cwEl = h('section', 'cw');
+cwEl.hidden = true;
+const cwStrip = h('div', 'cwstrip');
+cwEl.append(h('div', 'cwhead', 'Continue watching'), cwStrip);
+$('list').prepend(cwEl);
+const cwCards = new Map(); // "key:fileIndex" -> card
+const cwVal = new Map(); // "key:fileIndex" -> last seen seconds
+let cwScanned = false;
+let cwAt = {};
+try { cwAt = JSON.parse(localStorage.getItem('tide:cwAt') || '{}') || {}; } catch { cwAt = {}; }
+
+function resumeEntries() {
+  let ls;
+  try { ls = window.localStorage; } catch { return []; }
+  const out = [];
+  let dirty = false;
+  try {
+    for (let i = 0; i < ls.length; i++) {
+      const m = RESUME_RE.exec(ls.key(i) || '');
+      if (!m) continue;
+      const secs = parseFloat(ls.getItem(m[0]));
+      if (!isFinite(secs) || secs <= 0) continue;
+      const fk = `${m[1]}:${m[2]}`;
+      if ((cwScanned && cwVal.get(fk) !== secs) || !cwAt[fk]) { cwAt[fk] = cwScanned ? Date.now() : 1; dirty = true; }
+      cwVal.set(fk, secs);
+      out.push({ fk, lsKey: m[0], key: m[1], idx: Number(m[2]), secs });
+    }
+  } catch { return []; }
+  cwScanned = true;
+  if (dirty) {
+    const live = new Set(out.map((e) => e.fk));
+    for (const k of Object.keys(cwAt)) if (!live.has(k)) delete cwAt[k];
+    try { ls.setItem('tide:cwAt', JSON.stringify(cwAt)); } catch { /* ignore */ }
+  }
+  return out;
+}
+
+// [title line, episode/year] for a resume entry.
+function cwLabel(e) {
+  const t = rows.get(e.key).last, m = infoOf(e.key), eps = packOf(e.key);
+  const f = eps && eps.find((x) => x.file_index === e.idx);
+  if (f && f.episode != null) return `${showName(t)} · ${code(f.season, f.episode)}`;
+  if (matched(m) && m.media_type === 'tv') return m.season != null && m.episode != null ? `${m.title} · ${code(m.season, m.episode)}` : m.title;
+  const p = parsed.get(t.name);
+  if (!matched(m) && p && p.is_tv && p.episode != null) return `${p.title} · ${code(p.season, p.episode)}`;
+  return mediaTitle(t, m);
+}
+const clock = (s) => { s = Math.floor(s); const hh = Math.floor(s / 3600), mm = Math.floor(s / 60) % 60; return `${hh ? `${hh}:${pad2(mm)}` : mm}:${pad2(s % 60)}`; };
+function posterFor(key) {
+  const r = rows.get(key);
+  if (r && r.artUrl) return r.artUrl;
+  const gid = r && r.group, gr = gid && lastGroups.get(gid);
+  const w = gr && gr.keys.map((k) => rows.get(k)).find((x) => x && x.artUrl);
+  return w ? w.artUrl : null;
+}
+
+function createCwCard(e) {
+  const C = { el: h('div', 'cwcard'), pic: h('div', 'cwpic'), title: h('div', 'cwtitle'), sub: h('div', 'cwsub'), bar: h('div', 'cwbar'), fill: h('i') };
+  C.el.setAttribute('role', 'button');
+  C.el.tabIndex = 0;
+  const text = h('div', 'cwtext');
+  text.append(C.title, C.sub);
+  C.bar.append(C.fill);
+  const x = h('button', 'cwx', '×');
+  x.type = 'button';
+  x.title = 'Remove from Continue watching';
+  x.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    try { localStorage.removeItem(e.lsKey); } catch { /* ignore */ }
+    renderContinue();
+  });
+  const rb = remoteBtn(() => [e.key, e.idx]);
+  rb.classList.add('cwr');
+  C.el.append(C.pic, text, x, rb, C.bar);
+  C.el.addEventListener('click', () => play(e.key, e.idx));
+  C.el.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') play(e.key, e.idx); });
+  return C;
+}
+
+function renderContinue() {
+  const entries = resumeEntries()
+    .filter((e) => { const r = rows.get(e.key); return r && r.last && !watched[e.fk]; })
+    .sort((a, b) => (cwAt[b.fk] || 0) - (cwAt[a.fk] || 0) || a.fk.localeCompare(b.fk))
+    .slice(0, CW_MAX);
+  cwEl.hidden = !entries.length;
+  const seen = new Set();
+  entries.forEach((e, i) => {
+    seen.add(e.fk);
+    let C = cwCards.get(e.fk);
+    if (!C) { C = createCwCard(e); cwCards.set(e.fk, C); }
+    const title = cwLabel(e);
+    if (C.title.textContent !== title) { C.title.textContent = title; C.el.title = title; }
+    const info = infoOf(e.key);
+    const dur = info && info.runtime_min ? info.runtime_min * 60 : 0;
+    const sub = dur && e.secs < dur ? eta(dur - e.secs) : `Resume at ${clock(e.secs)}`;
+    if (C.sub.textContent !== sub) C.sub.textContent = sub;
+    const w = `${dur ? Math.min(100, (e.secs / dur) * 100).toFixed(1) : 0}%`;
+    if (C.fill.style.width !== w) C.fill.style.width = w;
+    C.bar.hidden = !dur;
+    const url = posterFor(e.key);
+    if (C.url !== url) {
+      C.url = url;
+      C.pic.style.backgroundImage = url ? `url("${url}")` : '';
+      C.pic.classList.toggle('none', !url);
+    }
+    if (cwStrip.children[i] !== C.el) cwStrip.insertBefore(C.el, cwStrip.children[i] || null);
+  });
+  for (const [fk, C] of cwCards) if (!seen.has(fk)) { C.el.remove(); cwCards.delete(fk); }
+}
+window.addEventListener('storage', (e) => { if (!e.key || RESUME_RE.test(e.key)) renderContinue(); });
+
+// ---------- library view (poster grid) ----------
+let view = 'list';
+try { if (localStorage.getItem('tide:view') === 'library') view = 'library'; } catch { /* ignore */ }
+const seg = h('div', 'seg');
+seg.setAttribute('role', 'tablist');
+const segBtn = (v, label) => {
+  const b = h('button', null, label);
+  b.type = 'button';
+  b.addEventListener('click', () => setView(v));
+  seg.append(b);
+  return b;
+};
+const segList = segBtn('list', 'List');
+const segLib = segBtn('library', 'Library');
+wGear.before(seg);
+
+const lib = h('main');
+lib.id = 'lib';
+const libGrid = h('div', 'lgrid');
+const libEmpty = h('p', 'libempty', 'No movies or shows yet');
+lib.append(libGrid, libEmpty);
+$('list').after(lib);
+const libTiles = new Map(); // tile id -> tile
+
+function setView(v, save = true) {
+  view = v === 'library' ? 'library' : 'list';
+  document.body.classList.toggle('lib-on', view === 'library');
+  segList.classList.toggle('on', view === 'list');
+  segLib.classList.toggle('on', view === 'library');
+  if (save) try { localStorage.setItem('tide:view', view); } catch { /* ignore */ }
+  closeMenu();
+  if (view === 'library') renderLibrary();
+}
+
+const downloadingish = (t) => ['downloading', 'initializing', 'paused'].includes(t.state) && t.progress < 1;
+
+function libItems() {
+  const items = [];
+  const seenG = new Set();
+  for (const t of lastList) {
+    const r = rows.get(t.key);
+    if (!r || !r.last) continue;
+    if (r.group) {
+      if (seenG.has(r.group)) continue;
+      seenG.add(r.group);
+      const gr = lastGroups.get(r.group);
+      if (!gr) continue;
+      let eps = 0, seen = 0, total = 0, done = 0, live = false;
+      for (const k of gr.keys) {
+        const x = rows.get(k).last, pk = packOf(k);
+        if (pk) { eps += pk.length; seen += pk.filter((f) => watched[`${k}:${f.file_index}`]).length; } else { eps++; if (isWatched(k)) seen++; }
+        total += x.total_bytes; done += x.progress_bytes;
+        if (downloadingish(x)) live = true;
+      }
+      const G = groupEls.get(gr.gid);
+      const best = gr.keys.map((k) => rows.get(k)).filter((x) => x.artUrl).sort((a, b) => b.artPri - a.artPri)[0];
+      items.push({ id: `s:${gr.keys[0]}`, series: true, keys: gr.keys, name: (G && G.name.textContent) || gr.name,
+        sub: `${plural(eps, 'episode')}${seen ? ` · ${seen} watched` : ''}`, url: best ? best.artUrl : null,
+        progress: live && total ? done / total : null, watched: eps > 0 && seen >= eps });
+      continue;
+    }
+    if (t.state === 'resolving') continue;
+    const m = infoOf(t.key), p = parsed.get(t.name);
+    if (!(matched(m) || r.artUrl || (p && (p.year || p.is_tv)))) continue;
+    let name, sub;
+    if (matched(m)) {
+      name = m.title;
+      sub = m.media_type === 'tv' && m.season != null && m.episode != null ? code(m.season, m.episode) : m.year ? String(m.year) : '';
+    } else {
+      name = (p && p.title) || t.name;
+      sub = p && p.is_tv && p.episode != null ? code(p.season, p.episode) : p && p.year ? String(p.year) : '';
+    }
+    const rt = rating(m);
+    if (rt) sub = sub ? `${sub} · ★ ${rt}` : `★ ${rt}`;
+    items.push({ id: `t:${t.key}`, key: t.key, name, sub, url: r.artUrl || null,
+      progress: downloadingish(t) ? t.progress : null, watched: isWatched(t.key) });
+  }
+  return items;
+}
+
+function createTile(it) {
+  const L = { el: h('div', 'ltile'), pic: h('div', 'lpic'), ph: h('div', 'lph'), name: h('div', 'lname'), sub: h('div', 'lsub'),
+    bar: h('div', 'lbar'), fill: h('i'), badge: h('span', 'lbadge', '✓') };
+  L.el.setAttribute('role', 'button');
+  L.el.tabIndex = 0;
+  L.bar.append(L.fill);
+  L.pic.append(L.ph, L.badge, L.bar);
+  L.el.append(L.pic, L.name, L.sub);
+  const open = () => (L.item.series ? showSeries(L.item.keys) : openSheet(L.item.key));
+  L.el.addEventListener('click', open);
+  L.el.addEventListener('keydown', (e) => { if (e.key === 'Enter') open(); });
+  return L;
+}
+
+function renderLibrary() {
+  const items = libItems();
+  const seen = new Set();
+  items.forEach((it, i) => {
+    seen.add(it.id);
+    let L = libTiles.get(it.id);
+    if (!L) { L = createTile(it); libTiles.set(it.id, L); }
+    L.item = it;
+    if (L.name.textContent !== it.name) { L.name.textContent = it.name; L.ph.textContent = it.name; L.el.title = it.name; }
+    if (L.sub.textContent !== it.sub) L.sub.textContent = it.sub;
+    if (L.url !== it.url) {
+      L.url = it.url;
+      L.pic.style.backgroundImage = it.url ? `url("${it.url}")` : '';
+      L.pic.classList.toggle('none', !it.url);
+    }
+    L.bar.hidden = it.progress == null;
+    const w = `${((it.progress || 0) * 100).toFixed(2)}%`;
+    if (L.fill.style.width !== w) L.fill.style.width = w;
+    L.badge.hidden = !it.watched;
+    if (libGrid.children[i] !== L.el) libGrid.insertBefore(L.el, libGrid.children[i] || null);
+  });
+  for (const [id, L] of libTiles) if (!seen.has(id)) { L.el.remove(); libTiles.delete(id); }
+  libEmpty.hidden = !!items.length || !lastList.length;
+}
+
+// Movie -> its detail panel in an overlay sheet (same renderer as the list).
+const libSheet = h('div', 'lsheet');
+const libBox = h('div', 'lbox');
+const libClose = h('button', 'wx lclose', '×');
+libClose.type = 'button';
+libClose.title = 'Close';
+libClose.addEventListener('click', closePanel);
+libBox.append(libClose);
+libSheet.append(libBox);
+libSheet.addEventListener('mousedown', (e) => { if (e.target === libSheet) closePanel(); });
+document.body.append(libSheet);
+
+function openSheet(key) {
+  closePanel();
+  const r = rows.get(key);
+  if (!r) return;
+  openKey = key;
+  r.panel = buildPanel(key);
+  libBox.append(r.panel.el);
+  libBox.scrollTop = 0;
+  document.body.classList.add('sheet-open');
+  updatePanel(key);
+  invoke('get_torrent_details', { key }).then((d) => { r.details = d; if (r.panel) fillMore(r.panel, key, d); }, () => {});
+}
+
+// Series -> the group in the list view, expanded and briefly highlighted.
+function showSeries(keys) {
+  const r = keys.map((k) => rows.get(k)).find((x) => x && x.group);
+  setView('list');
+  if (!r) return;
+  const gid = r.group;
+  expanded.add(gid);
+  render(lastList);
+  const G = groupEls.get(gid);
+  if (!G) return;
+  G.el.scrollIntoView({ block: 'start' });
+  G.head.classList.add('hl');
+  setTimeout(() => G.head.classList.remove('hl'), 1200);
+}
+setView(view, false);
 
 // =====================================================================
 // Mock backend: lets the UI run in a plain browser (no window.__TAURI__).
@@ -982,6 +1747,8 @@ var MOCK = T ? null : (() => {
     mk(8, 'The.Lighthouse.Keepers.S01E01.1080p.WEB-DL', 'completed', 1.4 * GB, 1),
     mk(9, 'The.Lighthouse.Keepers.S01E02.1080p.WEB-DL', 'completed', 1.5 * GB, 1),
     mk(10, 'The.Lighthouse.Keepers.S01E03.1080p.WEB-DL', 'downloading', 1.5 * GB, 0.38, { down_bps: 1.8 * MB, peers: 17 }),
+    mk(11, 'The Lighthouse Keepers S01 Part 2 1080p', 'completed', 4.4 * GB, 1),
+    mk(12, 'Northern.Lights.S02.COMPLETE.1080p.WEB-DL', 'downloading', 9.6 * GB, 0.41, { down_bps: 4.2 * MB, peers: 38 }),
   ];
   const files = {
     [hash(1)]: [['Big Buck Bunny.mp4', 'video', 4.1 * GB], ['Big Buck Bunny.en.srt', 'subtitle', 48e3], ['Big Buck Bunny.tr.srt', 'subtitle', 51e3], ['poster.jpg', 'other', 820e3]],
@@ -992,12 +1759,43 @@ var MOCK = T ? null : (() => {
     [hash(8)]: [['The.Lighthouse.Keepers.S01E01.mp4', 'video', 1.4 * GB]],
     [hash(9)]: [['The.Lighthouse.Keepers.S01E02.mp4', 'video', 1.5 * GB]],
     [hash(10)]: [['The.Lighthouse.Keepers.S01E03.mp4', 'video', 1.5 * GB]],
+    [hash(11)]: [4, 5, 6].map((e) => [`The.Lighthouse.Keepers.S01E0${e}.1080p.mp4`, 'video', 1.45 * GB]).concat([['Sample/lighthouse.sample.mp4', 'video', 20 * MB]]),
+    [hash(12)]: [...Array.from({ length: 6 }, (_, i) => [`Northern.Lights.S02/Northern.Lights.S02E0${i + 1}.1080p.WEB-DL.mkv`, 'video', 1.6 * GB]),
+      ['Northern.Lights.S02/Northern.Lights.S02E01.en.srt', 'subtitle', 52e3], ['Northern.Lights.S02/Sample/northern.lights.s02e01.sample.mkv', 'video', 30 * MB]],
     [hash(6)]: Array.from({ length: 8 }, (_, i) => [`Season 3/Episode ${String(i + 1).padStart(2, '0')}.mp3`, 'audio', 101 * MB]),
   };
+  // Tiny stand-in for the Rust name parser (mock only).
+  const mockParse = (name) => {
+    const s = name.replace(/\.(mkv|mp4|m4v|avi|mp3)$/i, '');
+    const se = /^(.*?)[\s._-]+s(\d{1,2})(?:[\s._-]?e(\d{1,3}))?(?=[\s._-]|$)/i.exec(s) || /^(.*?)[\s._-]+(\d{1,2})x(\d{2,3})\b/i.exec(s);
+    const yr = /^(.*?)[\s._(-]+((?:19|20)\d{2})\b/.exec(s);
+    const raw = se ? se[1] : yr ? yr[1] : s;
+    const title = raw.replace(/[._]+/g, ' ').trim();
+    const norm = title.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().replace(/^(the|a|an) /, '');
+    return { title, norm, year: yr ? +yr[2] : null, season: se ? +se[2] : null, episode: se && se[3] ? +se[3] : null, is_tv: !!se };
+  };
+  // Mock resume positions for "Continue watching" (seeded once; #nocw skips).
+  try {
+    if (!location.hash.includes('nocw') && !Object.keys(localStorage).some((k) => k.startsWith('tide:resume:'))) {
+      [[7, 0, 1260], [9, 0, 1530], [12, 2, 610], [1, 0, 240], [8, 0, 900]]
+        .forEach(([n, i, s]) => localStorage.setItem(`tide:resume:${hash(n)}:${i}`, String(s)));
+    }
+  } catch { /* ignore */ }
   const listeners = [];
   const groupsFile = { groups: [], excluded: {} };
   const watchedFile = { [`${hash(8)}:0`]: true };
   let gseq = 0;
+  const watcherFile = { settings: { torznab_url: location.hash.includes('nosearch') ? '' : 'http://localhost:9696/1/', api_key: 'mock', auto_add: false, quality: '1080p' },
+    unfollowed: [], last_check: 0, seen: {} };
+  const mres = (title, size, seeders, quality, n) => ({ title, size, seeders, quality, magnet: `magnet:?xt=urn:btih:${hash(100 + n)}&dn=${encodeURIComponent(title)}` });
+  const MOCK_NEW_EPS = [
+    { imdb_id: 'tt9000001', show: 'The Lighthouse Keepers', season: 1, episode: 7, episode_title: 'Slack Water', released: '2026-10-14T05:00:00.000Z', results: [
+      mres('The.Lighthouse.Keepers.S01E07.1080p.WEB-DL.DDP5.1.H.264', 2.1 * GB, 340, '1080p', 1),
+      mres('The.Lighthouse.Keepers.S01E07.1080p.WEB.h265', 1.2 * GB, 85, '1080p', 2),
+      mres('The.Lighthouse.Keepers.S01E07.720p.WEB.x264', 980 * MB, 610, '720p', 3),
+      mres('The.Lighthouse.Keepers.S01E07.2160p.WEB-DL.HDR', 6.4 * GB, 41, '2160p', 4)] },
+    { imdb_id: 'tt11280740', show: 'Severance', season: 2, episode: 6, episode_title: 'Attila', released: '2026-10-15T05:00:00.000Z', results: [] },
+  ];
   const detach = (key) => { groupsFile.groups.forEach((g) => { g.members = g.members.filter((k) => k !== key); }); delete groupsFile.excluded[key]; };
   const find = (key) => list.find((t) => t.key === key);
   const err = (s) => Promise.reject(s);
@@ -1014,7 +1812,31 @@ var MOCK = T ? null : (() => {
     listeners.forEach((cb) => cb({ payload: list.map((t) => ({ ...t })) }));
   }, 1000);
 
+  const netFile = { detected: true, metered: true, expensive: true, constrained: false, mode: 'pause', limit_kbps: 200,
+    paused_by_netmode: [hash(1), hash(2), hash(3)], ssid: 'Pixel 7', network_id: 'ssid:Pixel 7', manual: null };
+  let notifyOn = true;
+  const ago = (d) => Math.floor(Date.now() / 1000) - d * 86400;
+  let cleanupItems = [
+    { key: hash(1), file_index: null, name: 'Big Buck Bunny (2008)', size: 2.4 * GB, completed_at: ago(45) },
+    { key: hash(2), file_index: 3, name: 'Sintel S01E03.mkv', size: 1.8 * GB, completed_at: ago(62) },
+  ];
+  const rDevs = [{ id: 'd1', name: "mshn's Mac mini", host: '192.168.1.30', port: 47900, online: true }];
+  let rEnabled = true;
+  const rStatus = () => ({ enabled: rEnabled, port: rEnabled ? 47900 : null, name: 'MacBook Air', lanIp: '192.168.1.20', devices: rDevs.map((d) => ({ ...d })) });
   const api = {
+    remote_status: rStatus,
+    remote_set_enabled: ({ enabled }) => { rEnabled = enabled; return rStatus(); },
+    remote_discover: () => [{ id: 'd1', name: "mshn's Mac mini", host: '192.168.1.30', port: 47900, paired: !!rDevs.find((d) => d.id === 'd1') },
+      { id: 'd2', name: 'Living Room iMac', host: '192.168.1.41', port: 47900, paired: !!rDevs.find((d) => d.id === 'd2') }],
+    remote_pair_start: ({ host }) => ({ id: 'd2', name: host === '192.168.1.30' ? "mshn's Mac mini" : 'Living Room iMac' }),
+    remote_add_manual: ({ host }) => ({ id: 'd2', name: `Mac at ${host}` }),
+    remote_pair_finish: ({ host, port, code }) => {
+      if (code !== '123456') return err('BAD_CODE: wrong code — try again');
+      const d = { id: 'd2', name: 'Living Room iMac', host, port, online: true };
+      rDevs.push(d); return d;
+    },
+    remote_unpair: ({ id }) => { const i = rDevs.findIndex((d) => d.id === id); if (i >= 0) rDevs.splice(i, 1); return null; },
+    remote_play: ({ deviceId }) => (rDevs.find((d) => d.id === deviceId) ? null : err('NOT_FOUND: device is not paired')),
     list_torrents: () => list.map((t) => ({ ...t })),
     add_magnet: ({ magnet }) => {
       const m = /btih:([0-9a-f]{40})/i.exec(magnet) || /^([0-9a-f]{40})$/i.exec(magnet);
@@ -1041,6 +1863,12 @@ var MOCK = T ? null : (() => {
           playable_builtin: /\.(mp4|m4v|mov|webm|mp3|m4a|aac|wav|flac)$/i.test(name) };
       });
     },
+    parse_names: ({ names }) => names.map(mockParse),
+    list_episodes: ({ key }) => Promise.resolve(api.list_files({ key })).then((fs) => fs
+      .filter((f) => f.kind === 'video' && !/(^|\/)sample/i.test(f.name))
+      .map((f) => ({ f, p: mockParse(f.name.split('/').pop()) }))
+      .filter(({ p }) => p.episode != null)
+      .map(({ f, p }) => ({ file_index: f.index, season: p.season, episode: p.episode, title_hint: p.title, norm: p.norm, size: f.size, progress: f.progress }))),
     play_media: ({ media }) => (/\.mkv$/i.test(files[media.key][media.fileIndex][0]) ? err('VLC_NOT_FOUND: VLC is not installed') : null),
     open_external: () => null,
     get_artwork: ({ key }) => {
@@ -1078,6 +1906,36 @@ var MOCK = T ? null : (() => {
     delete_group: ({ id }) => { groupsFile.groups = groupsFile.groups.filter((g) => g.id !== id); return null; },
     get_watched: () => ({ ...watchedFile }),
     set_watched: ({ key, fileIndex, watched: w }) => { if (w) watchedFile[`${key}:${fileIndex}`] = true; else delete watchedFile[`${key}:${fileIndex}`]; return null; },
+    watcher_get_settings: () => ({ ...watcherFile.settings, unfollowed: [...watcherFile.unfollowed], last_check: watcherFile.last_check }),
+    watcher_set_settings: ({ torznabUrl, apiKey, autoAdd, quality }) => {
+      if (torznabUrl && !/^https?:\/\//.test(torznabUrl)) return err('INVALID_INPUT: Torznab URL must start with http:// or https://');
+      watcherFile.settings = { torznab_url: torznabUrl, api_key: apiKey, auto_add: autoAdd, quality };
+      return api.watcher_get_settings();
+    },
+    watcher_check: () => {
+      watcherFile.last_check = Math.floor(Date.now() / 1000);
+      const search = !!watcherFile.settings.torznab_url;
+      return MOCK_NEW_EPS
+        .filter((n) => !watcherFile.unfollowed.includes(n.imdb_id) && !watcherFile.seen[`${n.imdb_id}:${n.season}:${n.episode}`])
+        .map((n) => ({ ...n, results: search ? n.results : [] }));
+    },
+    watcher_follow: ({ imdbId }) => { watcherFile.unfollowed = watcherFile.unfollowed.filter((x) => x !== imdbId); return null; },
+    watcher_unfollow: ({ imdbId }) => { if (!watcherFile.unfollowed.includes(imdbId)) watcherFile.unfollowed.push(imdbId); return null; },
+    watcher_dismiss: ({ imdbId, season, episode }) => { watcherFile.seen[`${imdbId}:${season}:${episode}`] = 'dismissed'; return null; },
+    net_status: () => ({ ...netFile }),
+    net_set_mode: ({ mode, limitKbps }) => { netFile.mode = mode; if (limitKbps) netFile.limit_kbps = limitKbps; if (mode === 'off') netFile.paused_by_netmode = []; return { ...netFile }; },
+    net_mark_current: ({ metered }) => { netFile.manual = metered; netFile.metered = metered == null ? true : metered; return { ...netFile }; },
+    notify_get_settings: () => ({ enabled: notifyOn }),
+    notify_set_settings: ({ enabled }) => { notifyOn = enabled; return { enabled }; },
+    cleanup_candidates: () => {
+      const items = cleanupItems.slice();
+      return { items, total_bytes: items.reduce((a, c) => a + c.size, 0) };
+    },
+    cleanup_apply: ({ items }) => {
+      const removed = cleanupItems.filter((c) => items.some((i) => i.key === c.key && i.fileIndex === c.file_index));
+      cleanupItems = cleanupItems.filter((c) => !removed.includes(c));
+      return { removed, skipped: [], freed_bytes: removed.reduce((a, c) => a + c.size, 0) };
+    },
     get_torrent_details: ({ key }) => ({ info_hash: key, magnet: `magnet:?xt=urn:btih:${key}&dn=${encodeURIComponent(find(key).name)}`, trackers: 7, save_path: find(key).output_path }),
   };
 
@@ -1109,6 +1967,8 @@ var MOCK = T ? null : (() => {
     ...Object.fromEntries([[8, 'Lamp Oil'], [9, 'The Fog Bell'], [10, 'Low Tide']].map(([n, et], i) => [hash(n), { ...base, imdb_id: 'tt9000001',
       media_type: 'tv', title: 'The Lighthouse Keepers', year: 2025, season: 1, episode: i + 1, episode_title: et, genres: ['Drama'], runtime_min: 45,
       imdb_rating: 8.1, overview: 'Two keepers, one island, and a light that must never go out.' }])),
+    [hash(11)]: { ...base, imdb_id: 'tt9000001', media_type: 'tv', title: 'The Lighthouse Keepers', year: 2025, season: 1, genres: ['Drama'], runtime_min: 45,
+      imdb_rating: 8.1, overview: 'Two keepers, one island, and a light that must never go out.' },
     [hash(2)]: { ...base, imdb_id: '', media_type: 'movie', title: 'Sintel', year: 2010, genres: [], runtime_min: null, imdb_rating: null, overview: '', needs_match: true },
   };
   const MOCK_RESULTS = [
@@ -1118,7 +1978,7 @@ var MOCK = T ? null : (() => {
   const LH = svgUrl(`<rect width="200" height="300" fill="#13243a"/><path d="M88 110h24l8 130H80z" fill="#e8e1d2"/><path d="M84 96h32v14H84z" fill="#f4c95d"/>
       <path d="M100 103 L200 70 V136z" fill="#f4c95d" opacity=".35"/><path d="M0 240 Q100 225 200 240 V300 H0z" fill="#0a1626"/>
       <text x="100" y="282" text-anchor="middle" font-family="Georgia" font-size="17" fill="#e8e1d2">THE LIGHTHOUSE KEEPERS</text>`);
-  const MOCK_MEDIA_POSTERS = { [hash(8)]: LH, [hash(9)]: LH, [hash(10)]: LH, [hash(1)]: MOCK_POSTERS[hash(1)], [hash(7)]: svgUrl(`<rect width="200" height="300" fill="#e9ecef"/><rect x="40" y="90" width="120" height="80" fill="#0b3d5c"/>
+  const MOCK_MEDIA_POSTERS = { [hash(8)]: LH, [hash(9)]: LH, [hash(10)]: LH, [hash(11)]: LH, [hash(1)]: MOCK_POSTERS[hash(1)], [hash(7)]: svgUrl(`<rect width="200" height="300" fill="#e9ecef"/><rect x="40" y="90" width="120" height="80" fill="#0b3d5c"/>
       <text x="100" y="250" text-anchor="middle" font-family="Helvetica" font-size="24" letter-spacing="4" fill="#0b3d5c">SEVERANCE</text>`) };
   MOCK_RESULTS[0].poster_url = MOCK_POSTERS[hash(2)];
   MOCK_RESULTS[1].poster_url = MOCK_POSTERS[hash(2)];
@@ -1129,10 +1989,15 @@ var MOCK = T ? null : (() => {
     if (f.includes('open') || f.includes('movie')) toggle(hash(1));
     if (f.includes('tv')) toggle(hash(7));
     if (f.includes('group')) { expanded.add('a:imdb:tt9000001'); render(list.map((t) => ({ ...t }))); }
+    if (f.includes('packs')) setTimeout(() => { groupEls.forEach((G, gid) => expanded.add(gid)); render(list.map((t) => ({ ...t }))); }, 2500);
     if (f.includes('adding')) { openAdd(); $('magnet').value = 'not a magnet'; setAddError('Not a magnet link'); }
     if (f.includes('confirm')) askRemove(list[0]);
     if (f.includes('toast')) reportError('VLC_NOT_FOUND: VLC is not installed');
     if (f.includes('hover')) rows.get(hash(1)).head.classList.add('hl');
+    if (f.includes('lib')) setView('library', false);
+    if (f.includes('sheet')) setTimeout(() => openSheet(hash(1)), 1500);
+    if (f.includes('settings')) setTimeout(() => wGear.click(), 300);
+    if (f.includes('pairreq')) showPairRequest({ code: '123456', from: "mshn's Mac mini" });
   }, 50);
 
   return {
@@ -1143,8 +2008,134 @@ var MOCK = T ? null : (() => {
   };
 })();
 
+// ---------- other Macs (remote play) in the settings popover ----------
+const rSec = sSection('Other Macs');
+const rMe = h('p', 'whint rme');
+const rOn = h('input'); rOn.type = 'checkbox';
+const rOnL = h('label', 'check'); rOnL.append(rOn, document.createTextNode(' Allow playing from other Macs'));
+const rList = h('div', 'rlist');
+const rFind = h('button', 'wlink', 'Find Macs…'); rFind.type = 'button';
+const rAdd = h('button', 'wlink', 'Add by IP…'); rAdd.type = 'button';
+const rBtns = h('div', 'nrow rbtns'); rBtns.append(rFind, rAdd);
+const rExtra = h('div', 'rextra'); // discover results / IP input / code input
+const rMsg = h('p', 'wstatus');
+rSec.append(rMe, rOnL, rList, rBtns, rExtra, rMsg);
+wPop.append(rSec);
+const rSay = (m, bad) => { rMsg.textContent = m || ''; rMsg.className = `wstatus${bad ? ' bad' : ''}`; };
+// The popover is a <form>: Enter in our inputs must not submit the watcher settings.
+const rInput = (ph, onEnter) => {
+  const i = h('input'); i.type = 'text'; i.placeholder = ph; i.spellcheck = false;
+  i.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); onEnter(); } });
+  return i;
+};
+const rButton = (text, run, primary) => { const b = h('button', primary ? 'rbtn-p' : 'rbtn-s', text); b.type = 'button'; b.addEventListener('click', run); return b; };
+
+function renderRemote() {
+  const s = remote;
+  document.body.classList.toggle('has-remote', onlineDevices().length > 0);
+  if (!s) return;
+  rMe.textContent = s.enabled && s.port
+    ? `This Mac: ${s.name} · ${s.lanIp || '—'}:${s.port}`
+    : `This Mac: ${s.name}`;
+  rOn.checked = !!s.enabled;
+  rList.replaceChildren(...(s.devices || []).map((d) => {
+    const row = h('div', 'rdev');
+    const dot = h('span', `rdot${d.online ? ' on' : ''}`);
+    dot.title = d.online ? 'Online' : 'Offline';
+    const name = h('span', 'rname', d.name);
+    name.title = `${d.host}:${d.port}`;
+    const un = h('button', 'wlink', 'Unpair'); un.type = 'button';
+    un.addEventListener('click', () => invoke('remote_unpair', { id: d.id }).then(loadRemote, reportError));
+    row.append(dot, name, un);
+    return row;
+  }));
+}
+function loadRemote() { return invoke('remote_status').then((s) => { remote = s; renderRemote(); }, () => {}); }
+rOn.addEventListener('change', () => invoke('remote_set_enabled', { enabled: rOn.checked })
+  .then((s) => { remote = s; renderRemote(); }, (e) => { rOn.checked = !rOn.checked; reportError(e); }));
+
+// Step 2 of pairing: type the code the other Mac shows.
+function askCode(peer, host, port) {
+  const i = rInput('123456', () => go());
+  i.inputMode = 'numeric'; i.maxLength = 7; i.className = 'rcode';
+  const go = () => {
+    const code = i.value.replace(/\D/g, '');
+    if (code.length !== 6) return rSay('The code has 6 digits', true);
+    rSay('Pairing…');
+    invoke('remote_pair_finish', { host, port, code }).then((d) => {
+      rExtra.replaceChildren(); rSay(`Paired with ${d.name}`); loadRemote();
+    }, (e) => rSay(errMsg(e), true));
+  };
+  const row = h('div', 'nrow'); row.append(i, rButton('Pair', go, true), rButton('Cancel', () => { rExtra.replaceChildren(); rSay(''); }));
+  rExtra.replaceChildren(h('p', 'whint rask', `Enter the code shown on ${peer.name}`), row);
+  rSay('');
+  i.focus();
+}
+function startPair(p, host, port) {
+  rSay('Contacting…');
+  p.then((peer) => askCode(peer, host, port), (e) => rSay(errMsg(e), true));
+}
+rFind.addEventListener('click', () => {
+  rSay('Looking for Macs…');
+  rExtra.replaceChildren();
+  invoke('remote_discover').then((list) => {
+    rSay(list.length ? '' : 'No Macs found. Make sure Tide is open there, or add it by IP.');
+    rExtra.replaceChildren(...list.map((f) => {
+      const row = h('div', 'rdev');
+      const name = h('span', 'rname', f.name);
+      name.title = `${f.host}:${f.port}`;
+      row.append(name, f.paired ? h('span', 'wmuted', 'Paired')
+        : rButton('Pair', () => startPair(invoke('remote_pair_start', { host: f.host, port: f.port }), f.host, f.port), true));
+      return row;
+    }));
+  }, (e) => rSay(errMsg(e), true));
+});
+rAdd.addEventListener('click', () => {
+  const go = () => {
+    const v = i.value.trim();
+    const m = /^(.+?)(?::(\d{1,5}))?$/.exec(v);
+    if (!v || !m) return rSay('Type an address like 192.168.1.20:47900', true);
+    const host = m[1], port = m[2] ? Number(m[2]) : null;
+    startPair(invoke('remote_add_manual', port ? { host, port } : { host }), host, port || 47900);
+  };
+  const i = rInput('192.168.1.20:47900', go);
+  const row = h('div', 'nrow'); row.append(i, rButton('Add', go, true));
+  rExtra.replaceChildren(row);
+  rSay('');
+  i.focus();
+});
+wGear.addEventListener('click', () => { if (!wPop.hidden) { rExtra.replaceChildren(); rSay(''); loadRemote(); } });
+
+// Incoming pair request (this Mac shows the code the other one must type).
+const prCard = h('div', 'prcard');
+prCard.hidden = true;
+document.body.append(prCard);
+let prTimer;
+function showPairRequest(p) {
+  const code = String(p.code || '');
+  const close = h('button', 'rbtn-s', 'Close'); close.type = 'button';
+  close.addEventListener('click', () => { prCard.hidden = true; });
+  prCard.replaceChildren(h('p', 'prtitle', `Pair with ${p.from || 'another Mac'}?`), h('p', 'whint', 'Type this code on that Mac:'),
+    h('div', 'prcode', code.length === 6 ? `${code.slice(0, 3)} ${code.slice(3)}` : code), close);
+  prCard.hidden = false;
+  clearTimeout(prTimer);
+  prTimer = setTimeout(() => { prCard.hidden = true; }, 120000);
+}
+
 // ---------- boot ----------
 listen('torrents-updated', (e) => render(e.payload));
 refresh();
 reloadGroups();
 reloadWatched();
+if (T) listen('new-episodes', (e) => setEpisodes(e.payload));
+if (T) {
+  listen('net-status', (e) => { net = e.payload; renderNet(); });
+  listen('watched-changed', () => reloadWatched());
+}
+loadMoreSettings();
+loadRemote();
+if (T) {
+  listen('remote-devices-updated', () => loadRemote());
+  listen('remote-pair-request', (e) => showPairRequest(e.payload || {}));
+}
+loadWatcher().then(() => invoke('watcher_check', { force: false })).then(setEpisodes, () => {});

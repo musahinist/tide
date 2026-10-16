@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Tide</title>
   <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="youtube.css">
 </head>
 <body>
   <header id="top" data-tauri-drag-region>
@@ -17,6 +18,7 @@
     </button>
   </header>
 
+  <div id="yt-root"></div>
   <main id="list"></main>
   <p id="empty" hidden>Drop a magnet link or press ⌘V</p>
 
@@ -34,5 +36,6 @@
   <div id="toast" role="status"><span id="toast-msg"></span><button id="toast-act" hidden></button></div>
 
   <script src="app.js"></script>
+  <script src="youtube.js"></script>
 </body>
 </html>
