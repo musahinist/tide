@@ -264,14 +264,15 @@
     if (r.title.textContent !== j.title) { r.title.textContent = j.title; r.el.querySelector('.name').title = `${j.title}\n${j.url}`; }
     const badge = j.preset === 'audio_mp3' ? 'AUDIO' : 'VIDEO';
     if (r.badge.textContent !== badge) r.badge.textContent = badge;
-    const cls = `torrent yt s-${CSS_STATE[j.state] || j.state}`;
+    const ar = window.TideArchive && window.TideArchive.row ? window.TideArchive.row({ kind: 'yt', id: j.id }) : null;
+    const cls = `torrent yt s-${CSS_STATE[j.state] || j.state}${ar ? ` ar ar-${ar.state}` : ''}`;
     if (r.el.className !== cls) r.el.className = cls;
-    const line = statsLine(j);
+    const line = ar ? ar.line : statsLine(j);
     if (r.statsText.textContent !== line) r.statsText.textContent = line;
-    const w = `${((j.state === 'done' ? 1 : j.progress) * 100).toFixed(2)}%`;
+    const w = `${((ar && ar.frac != null ? ar.frac : j.state === 'done' ? 1 : j.progress) * 100).toFixed(2)}%`;
     if (r.fill.style.width !== w) r.fill.style.width = w;
     r.play.hidden = j.state !== 'done';
-    const target = j.state === 'done' ? archiveTarget() : null;
+    const target = j.state === 'done' && (!ar || ar.state === 'error') ? archiveTarget() : null;
     r.archive.hidden = !target;
     if (target) r.archive.title = `Move to ${target}`;
     r.cancel.hidden = !running(j.state);
@@ -305,7 +306,7 @@
   }
   const refresh = () => invoke('yt_list').then(render, () => {});
 
-  window.YT = { openProbeDialog, refresh };
+  window.YT = { openProbeDialog, refresh, rerender: () => render(jobs) };
 
   function start() {
     listen('yt-jobs-updated', (e) => render(e.payload));

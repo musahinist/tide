@@ -360,11 +360,13 @@ function updateRow(r, t) {
   const rem = t.remote || null;
   const cls = `torrent s-${t.state}${t.key === openKey ? ' open' : ''}${r.group ? ' ep' : ''}${r.pack ? ' pack' : ''}${rem ? ' remote' : ''}`;
   setDevTag(r.dev, rem);
-  if (r.el.className !== cls) r.el.className = cls;
   const rt = rating(m);
-  const line = statsLine(t) + (rt ? ` · IMDb ${rt}` : '');
+  const ar = rem ? null : arRow({ kind: 'torrent', key: t.key });
+  const cls2 = ar ? `${cls} ar ar-${ar.state}` : cls;
+  if (r.el.className !== cls2) r.el.className = cls2;
+  const line = ar ? ar.line : statsLine(t) + (rt ? ` · IMDb ${rt}` : '');
   if (r.statsText.textContent !== line) r.statsText.textContent = line;
-  const w = `${(t.state === 'resolving' ? 0 : t.progress * 100).toFixed(2)}%`;
+  const w = `${(ar && ar.frac != null ? ar.frac * 100 : t.state === 'resolving' ? 0 : t.progress * 100).toFixed(2)}%`;
   if (r.fill.style.width !== w) r.fill.style.width = w;
 
   const ready = t.state !== 'resolving' && t.id != null;
@@ -865,7 +867,8 @@ function openMenu(anchor, ctx) {
     items.push(menuItem('Add to group…', () => groupPicker(key, gid)));
     if (gid) items.push(menuItem('Remove from group', () => { closeMenu(); act(invoke('remove_from_group', { key })); }));
     const target = archiveTarget(), row = rows.get(key);
-    if (target && row && row.last && row.last.state === 'completed') {
+    const inQ = arRow({ kind: 'torrent', key });
+    if (target && row && row.last && row.last.state === 'completed' && (!inQ || inQ.state === 'error')) {
       items.push(menuItem(`Move to ${target}`, () => { closeMenu(); archiveMove({ key }); }));
     }
   } else {
@@ -1705,6 +1708,15 @@ const segBtn = (v, label) => {
 const segList = segBtn('list', 'List');
 const segLib = segBtn('library', 'Library');
 wGear.before(seg);
+const arPill = h('button', 'arpill');
+arPill.type = 'button';
+arPill.hidden = true;
+arPill.title = 'Archive moves — open Settings';
+arPill.addEventListener('click', () => {
+  if (wPop.hidden) wGear.click();
+  setTimeout(() => aSec.scrollIntoView({ block: 'nearest' }), 50);
+});
+seg.before(arPill);
 
 const lib = h('main');
 lib.id = 'lib';
@@ -1953,7 +1965,31 @@ var MOCK = T ? null : (() => {
     paused_by_netmode: [hash(1), hash(2), hash(3)], ssid: 'Pixel 7', network_id: 'ssid:Pixel 7', manual: null };
   let notifyOn = true;
   let arAuto = true;
-  let arQueue = [];
+  let arQueue = []; // mock mover: one at a time, ~55 MB/s, 2 s verify, done shown 10 s
+  setInterval(() => {
+    arQueue = arQueue.filter((e) => !(e.state === 'done' && Date.now() - e._at > 10000));
+    const cur = arQueue.find((e) => e.state === 'moving' || e.state === 'verifying');
+    if (!cur) {
+      const n = arQueue.find((e) => e.state === 'queued');
+      if (n) { n.state = 'moving'; arQueue = [n, ...arQueue.filter((e) => e !== n)]; }
+      return;
+    }
+    if (cur.state === 'verifying') {
+      if (Date.now() - cur._at > 2000) {
+        Object.assign(cur, { state: 'done', _at: Date.now() });
+        const i = list.findIndex((t) => t.key === cur.key);
+        if (i >= 0) list.splice(i, 1);
+      }
+      return;
+    }
+    cur.bytes_done = Math.min(cur.bytes_total, cur.bytes_done + 55e6 * (0.8 + Math.random() * 0.4));
+    if (cur.bytes_done >= cur.bytes_total) Object.assign(cur, { state: 'verifying', _at: Date.now() });
+  }, 1000);
+  const arQueueItem = (key, ytId) => {
+    const t = key && list.find((x) => x.key === key);
+    return { kind: key ? 'torrent' : 'yt', ...(key ? { key } : { id: ytId }), name: t ? t.name : String(ytId || key),
+      bytes_done: 0, bytes_total: t ? t.total_bytes : 300 * MB, state: 'queued', error: null };
+  };
   const ago = (d) => Math.floor(Date.now() / 1000) - d * 86400;
   let cleanupItems = [
     { key: hash(1), file_index: null, name: 'Big Buck Bunny (2008)', size: 2.4 * GB, completed_at: ago(45) },
@@ -2005,8 +2041,15 @@ var MOCK = T ? null : (() => {
     archive_settings: () => ({ archive_dir: null, available: false, free_bytes: null, error: null, autoclean_days: null, archive_auto: arAuto,
       device: { id: 'd1', name: "mshn's Mac mini", online: true, available: true, archive_dir: '/Volumes/NEO Storage/Tidebox', free_bytes: 185e9 } }),
     archive_set_settings: ({ archiveAuto }) => { if (archiveAuto != null) arAuto = archiveAuto; return api.archive_settings(); },
-    archive_status: () => ({ queue: arQueue, device: api.archive_settings().device, auto: arAuto }),
-    archive_move: ({ key }) => { arQueue = [{ kind: 'torrent', key, name: 'Animals (2026)', bytes_done: 1.2e9, bytes_total: 1.7e9, state: 'moving', error: null }]; return api.archive_status(); },
+    archive_status: () => ({ queue: arQueue.map(({ _at, ...e }) => ({ ...e })), device: api.archive_settings().device, auto: arAuto }),
+    archive_move: ({ key, ytId }) => {
+      const same = (e) => (key ? e.key === key : e.id === ytId);
+      if (arQueue.some((e) => same(e) && (e.state === 'moving' || e.state === 'verifying'))) return api.archive_status();
+      arQueue = arQueue.filter((e) => !same(e));
+      const at = arQueue.findIndex((e) => e.state !== 'moving' && e.state !== 'verifying');
+      arQueue.splice(at < 0 ? arQueue.length : at, 0, arQueueItem(key, ytId));
+      return api.archive_status();
+    },
     remote_set_enabled: ({ enabled }) => { rEnabled = enabled; return rStatus(); },
     remote_discover: () => [{ id: 'd1', name: "mshn's Mac mini", host: '192.168.1.30', port: 47900, paired: !!rDevs.find((d) => d.id === 'd1') },
       { id: 'd2', name: 'Living Room iMac', host: '192.168.1.41', port: 47900, paired: !!rDevs.find((d) => d.id === 'd2') }],
@@ -2182,6 +2225,7 @@ var MOCK = T ? null : (() => {
     if (f.includes('lib')) setView('library', false);
     if (f.includes('sheet')) setTimeout(() => openSheet(hash(1)), 1500);
     if (f.includes('settings')) setTimeout(() => wGear.click(), 300);
+    if (f.includes('archive')) list.filter((t) => t.state === 'completed').forEach((t) => arQueue.push(arQueueItem(t.key)));
     if (f.includes('pairreq')) showPairRequest({ code: '123456', from: "mshn's Mac mini" });
   }, 50);
 
@@ -2349,13 +2393,105 @@ const archiveTarget = () => {
   const d = arSet && !arSet.archive_dir && arSet.device;
   return d ? d.name : null;
 };
-window.TideArchive = { target: archiveTarget, move: (args) => archiveMove(args) };
+window.TideArchive = { target: archiveTarget, move: (args) => archiveMove(args), row: (item) => arRow(item) };
+// Queue entries: {kind, key|id, name, bytes_done, bytes_total, state: queued|moving|verifying|done|error, error}.
+const arId = (e) => (e.kind === 'yt' ? `yt:${e.id}` : `t:${e.key}`);
+const arActive = (e) => e.state === 'moving' || e.state === 'verifying';
+const arPending = (e) => e.state === 'queued' || arActive(e);
+const arDevName = () => { const d = (arSt && arSt.device) || (arSet && arSet.device); return d ? d.name : 'the archive Mac'; };
+const arSamples = new Map(); // arId -> [[ms, bytes_done]] (last ~20 s, for speed / ETA)
+let arBatchDone = 0; // items finished since the queue was last empty ("2/6")
+function arSpeed(e) {
+  const s = arSamples.get(arId(e));
+  if (!s || s.length < 2) return null;
+  const [t0, b0] = s[0], [t1, b1] = s[s.length - 1];
+  return t1 - t0 >= 1500 && b1 > b0 ? ((b1 - b0) * 1000) / (t1 - t0) : null;
+}
+// Row view of an item's archive state, or null when it is not in the queue.
+function arRow(item) {
+  const q = (arSt && arSt.queue) || [];
+  const id = arId(item);
+  const e = q.find((x) => arId(x) === id);
+  if (!e) return null;
+  const dev = shortDev(arDevName());
+  const frac = e.bytes_total ? Math.min(1, e.bytes_done / e.bytes_total) : null;
+  switch (e.state) {
+    case 'moving': {
+      const parts = [`Moving to ${arDevName()}`];
+      if (frac != null) parts.push(pct(frac));
+      const bps = arSpeed(e);
+      if (bps) { parts.push(speed(bps)); if (e.bytes_total) parts.push(eta(Math.max(0, e.bytes_total - e.bytes_done) / bps)); }
+      return { state: 'moving', line: parts.join(' · '), frac: frac == null ? 0 : frac };
+    }
+    case 'verifying': return { state: 'verifying', line: `Verifying on ${dev}…`, frac: 1 };
+    case 'done': return { state: 'done', line: `Moved to ${dev}`, frac: 1 };
+    case 'error': return { state: 'error', line: `Could not move to ${dev}: ${errMsg(e.error || 'error')}`, frac: null };
+    default: {
+      const next = q.filter((x) => x.state === 'queued')[0] === e;
+      return { state: 'queued', line: next ? 'Queued — next' : `Queued for ${dev}`, frac: null };
+    }
+  }
+}
+function renderArPill() {
+  const q = (arSt && arSt.queue) || [];
+  const pend = q.filter(arPending);
+  arPill.hidden = !pend.length || !!(arSet && arSet.archive_dir);
+  if (arPill.hidden) return;
+  const cur = pend.find(arActive);
+  const dev = shortDev(arDevName());
+  const d = arSt && arSt.device;
+  let txt;
+  if (cur) {
+    const total = arBatchDone + pend.length;
+    const p = cur.state === 'verifying' ? 'verifying' : cur.bytes_total ? pct(cur.bytes_done / cur.bytes_total) : '…';
+    txt = `↗ ${dev} · ${arBatchDone + 1}/${total} · ${p}`;
+  } else {
+    txt = `↗ ${dev} · ${pend.length} waiting${d && !d.online ? ' (offline)' : ''}`;
+  }
+  if (arPill.textContent !== txt) arPill.textContent = txt;
+  arPill.classList.toggle('live', !!cur);
+}
+// New archive_status: samples, batch count, "moved" toasts, rows, pill, settings line.
+function arApply(st) {
+  const prev = arSt;
+  arSt = st || null;
+  const q = (arSt && arSt.queue) || [];
+  const now = Date.now();
+  for (const e of q) {
+    if (e.state !== 'moving') { arSamples.delete(arId(e)); continue; }
+    const s = arSamples.get(arId(e)) || [];
+    if (!s.length || s[s.length - 1][1] !== e.bytes_done) s.push([now, e.bytes_done]);
+    while (s.length > 2 && now - s[0][0] > 20000) s.shift();
+    arSamples.set(arId(e), s);
+  }
+  const before = new Map(((prev && prev.queue) || []).map((e) => [arId(e), e.state]));
+  let moved = 0;
+  for (const e of q) {
+    if (e.state !== 'done' || before.get(arId(e)) === 'done' || !prev) continue;
+    moved++;
+    const r = e.kind === 'torrent' && rows.get(e.key);
+    const name = (r && r.name.textContent) || e.name;
+    toast(`${name} moved to ${shortDev(arDevName())}`);
+  }
+  if (!q.some(arPending)) arBatchDone = 0; else arBatchDone += moved;
+  if (arSt && arSt.device && arSet) arSet.device = arSt.device;
+  renderArchive();
+  renderArPill();
+  render(lastList);
+  if (window.YT && window.YT.rerender) window.YT.rerender();
+  if (moved) { refresh(); if (window.YT) window.YT.refresh(); }
+}
 function archiveLine() {
   const q = (arSt && arSt.queue) || [];
-  const cur = q.find((e) => e.state === 'moving');
-  if (cur) return cur.bytes_total ? `Moving ${cur.name} — ${(cur.bytes_done / 1e9).toFixed(1)} / ${(cur.bytes_total / 1e9).toFixed(1)} GB` : `Moving ${cur.name}…`;
-  const waiting = q.filter((e) => e.state === 'queued').length;
-  const failed = q.find((e) => e.state === 'failed');
+  const cur = q.find(arActive);
+  const more = q.filter((e) => e.state === 'queued').length;
+  const tail = more ? ` · ${more} more queued` : '';
+  if (cur) {
+    if (cur.state === 'verifying') return `Verifying ${cur.name} on ${shortDev(arDevName())}…${tail}`;
+    return (cur.bytes_total ? `Moving ${cur.name} — ${(cur.bytes_done / 1e9).toFixed(1)}/${(cur.bytes_total / 1e9).toFixed(1)} GB` : `Moving ${cur.name}…`) + tail;
+  }
+  const waiting = more;
+  const failed = q.find((e) => e.state === 'error');
   if (failed) return `Could not move ${failed.name}: ${errMsg(failed.error || '')}`;
   const d = arSet && arSet.device;
   if (waiting) return `${plural(waiting, 'item')} waiting${d && !d.online ? ` for ${d.name}` : ''}`;
@@ -2387,7 +2523,7 @@ function renderArchive() {
 }
 function loadArchive() {
   if (!arOk) return Promise.resolve();
-  return Promise.all([invoke('archive_settings'), invoke('archive_status')]).then(([s, st]) => { arSet = s; arSt = st; renderArchive(); if (window.YT) window.YT.refresh(); },
+  return Promise.all([invoke('archive_settings'), invoke('archive_status')]).then(([s, st]) => { arSet = s; arApply(st); if (window.YT) window.YT.refresh(); },
     (e) => { if (missingCmd(e)) { arOk = false; arSet = null; renderArchive(); } });
 }
 const setArchive = (args) => invoke('archive_set_settings', args).then((s) => { arSet = s; renderArchive(); }, reportError);
@@ -2396,9 +2532,10 @@ aDays.addEventListener('change', () => setArchive({ autocleanDays: Math.max(0, M
 aDays.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); aDays.blur(); } });
 function archiveMove(args) {
   return invoke('archive_move', args).then((st) => {
-    arSt = st; renderArchive();
+    arApply(st);
     const d = arSet && arSet.device;
-    toast(d && d.online ? `Moving to ${d.name}…` : `Will move when ${d ? d.name : 'the archive Mac'} is online`);
+    const r = arRow(args.key ? { kind: 'torrent', key: args.key } : { kind: 'yt', id: args.ytId });
+    toast(d && !d.online ? `Will move when ${d.name} is online` : r && r.state === 'queued' ? `Queued — moves next to ${shortDev(d ? d.name : '')}` : `Moving to ${d ? d.name : 'the archive Mac'}…`);
   }, reportError);
 }
 wGear.addEventListener('click', () => { if (!wPop.hidden) loadArchive(); });
@@ -2440,11 +2577,11 @@ if (T) {
   listen('remote-devices-updated', () => { loadRemote(); loadRemoteLib(); });
   listen('remote-pair-request', (e) => showPairRequest(e.payload || {}));
   listen('archive-progress', (e) => {
-    const prev = arSt;
-    arSt = e.payload || null;
-    if (arSt && arSt.device && arSet) arSet.device = arSt.device;
-    if (!arSet && arSt && arSt.device) loadArchive(); else renderArchive();
-    if (prev && arSt && (prev.queue || []).length > (arSt.queue || []).length) refresh();
+    arApply(e.payload);
+    if (!arSet && arSt && arSt.device) loadArchive();
   });
+} else {
+  // Mock mode has no events: poll.
+  setInterval(() => { if (arOk) invoke('archive_status').then(arApply, () => {}); }, 1000);
 }
 loadWatcher().then(() => invoke('watcher_check', { force: false })).then(setEpisodes, () => {});

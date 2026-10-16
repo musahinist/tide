@@ -11,6 +11,7 @@
   --warn: #d29922;
   --err: #e5534b;
   --track: #333;
+  --move: #a371f7; /* archive moves (Mac → Mac), distinct from download blue */
   color-scheme: dark;
 }
 
@@ -653,3 +654,21 @@ body:not(.has-remote) .rbtn, [hidden] + .rbtn { display: none !important; }
 .wpop .adir { margin-bottom: 8px; word-break: break-word; }
 .wpop .adir.bad { color: var(--err); }
 .wpop .aline { margin: 6px 0 0; font-variant-numeric: tabular-nums; }
+
+/* ---------- archive moves (to the paired Mac) ---------- */
+.torrent.ar-moving .dot, .torrent.ar-verifying .dot { background: var(--move); animation: none; }
+.torrent.ar-verifying .dot { animation: pulse 1.4s ease-in-out infinite; }
+.torrent.ar-queued .dot { background: transparent; box-shadow: inset 0 0 0 1.5px var(--move); }
+.torrent.ar-done .dot { background: var(--move); }
+.torrent.ar-moving .stats, .torrent.ar-verifying .stats { color: #c4a8f5; }
+.torrent.ar .bar i { background: var(--move); }
+.torrent.ar-queued .bar i, .torrent.ar-error .bar i { background: #6a6a6a; }
+.torrent.ar-moving .bar, .torrent.ar-verifying .bar { height: 2px; }
+.arpill {
+  flex: none; height: 24px; max-width: 220px; padding: 0 9px; border: 0; border-radius: 7px;
+  background: var(--row); color: var(--muted); font-size: 11.5px; font-weight: 500; line-height: 24px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; transition: color .15s, background .15s;
+}
+.arpill.live { color: #c4a8f5; }
+.arpill:hover { background: var(--row-hover); color: var(--text); }
+.arpill[hidden] { display: none; }

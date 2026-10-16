@@ -809,9 +809,79 @@ pub struct QEntry {
     pub name: String,
     pub bytes_done: u64,
     pub bytes_total: u64,
-    /// "queued" | "moving" | "failed"
+    /// "queued" | "moving" | "verifying" | "done" | "error". The list is in move order:
+    /// the in-flight item first, then what comes next.
     pub state: String,
     pub error: Option<String>,
+    /// Picked by hand (`archive_move`), not by auto mode.
+    #[serde(skip)]
+    manual: bool,
+    /// When it reached "done" (shown briefly, then dropped).
+    #[serde(skip)]
+    done_at: Option<Instant>,
+}
+
+const DONE_SHOW: Duration = Duration::from_secs(10);
+const ACTIVE: [&str; 2] = ["moving", "verifying"];
+
+fn q_entry(item: Item, name: String, manual: bool) -> QEntry {
+    QEntry { item, name, bytes_done: 0, bytes_total: 0, state: "queued".into(), error: None, manual, done_at: None }
+}
+
+/// Queue an item. `front`: right after the in-flight one (a manual pick jumps the line,
+/// without aborting the current transfer). An errored or done entry is re-queued.
+fn q_enqueue(q: &mut Vec<QEntry>, item: Item, name: String, front: bool) {
+    let pos = q.iter().position(|e| e.item == item);
+    if let Some(i) = pos {
+        if ACTIVE.contains(&q[i].state.as_str()) {
+            return;
+        }
+    }
+    let mut e = match pos {
+        Some(i) => q.remove(i),
+        None => q_entry(item, name, front),
+    };
+    e.state = "queued".into();
+    e.error = None;
+    e.done_at = None;
+    e.bytes_done = 0;
+    if front {
+        e.manual = true;
+        let at = q.iter().take_while(|x| ACTIVE.contains(&x.state.as_str())).count();
+        q.insert(at, e);
+    } else {
+        q.push(e);
+    }
+}
+
+/// Make the queue list every auto candidate (in order, after what is already queued) and
+/// drop auto entries that are no longer candidates. `retry_ok(item)`: an errored auto
+/// entry may be queued again.
+fn q_sync_auto(q: &mut Vec<QEntry>, cands: &[(Item, String)], retry_ok: impl Fn(&Item) -> bool) {
+    q.retain(|e| e.manual || e.state != "queued" || cands.iter().any(|(i, _)| i == &e.item));
+    for (item, name) in cands {
+        match q.iter_mut().find(|e| &e.item == item) {
+            Some(e) if e.state == "error" && retry_ok(item) => {
+                e.state = "queued".into();
+                e.error = None;
+            }
+            Some(_) => {}
+            None if retry_ok(item) => q.push(q_entry(item.clone(), name.clone(), false)),
+            None => {}
+        }
+    }
+}
+
+/// Drop the auto entries still waiting (auto mode turned off) and stale "done" ones.
+fn q_prune(q: &mut Vec<QEntry>, auto: bool) {
+    q.retain(|e| {
+        (auto || e.manual || e.state != "queued") && !(e.state == "done" && e.done_at.is_none_or(|t| t.elapsed() >= DONE_SHOW))
+    });
+}
+
+/// The first queued item (queue order) that is not busy.
+fn q_next(q: &[QEntry], busy: impl Fn(&Item) -> bool) -> Option<Item> {
+    q.iter().filter(|e| e.state == "queued").map(|e| e.item.clone()).find(|i| !busy(i))
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -869,7 +939,11 @@ impl Archiver {
     }
 
     pub fn status(&self) -> Value {
-        let q = self.queue.lock().unwrap().clone();
+        let q: Vec<QEntry> = {
+            let mut q = self.queue.lock().unwrap();
+            q.retain(|e| !(e.state == "done" && e.done_at.is_some_and(|t| t.elapsed() >= DONE_SHOW)));
+            q.clone()
+        };
         let device = self.device.lock().unwrap().clone();
         json!({ "queue": q, "device": device, "auto": archive_auto_setting() })
     }
@@ -893,16 +967,9 @@ impl Archiver {
         }
     }
 
-    fn enqueue(&self, item: Item, name: String) {
-        let mut q = self.queue.lock().unwrap();
-        match q.iter_mut().find(|e| e.item == item) {
-            Some(e) if e.state == "failed" => {
-                e.state = "queued".into();
-                e.error = None;
-            }
-            Some(_) => {}
-            None => q.push(QEntry { item, name, bytes_done: 0, bytes_total: 0, state: "queued".into(), error: None }),
-        }
+    /// Manual pick: next after the in-flight item.
+    fn enqueue_front(&self, item: Item, name: String) {
+        q_enqueue(&mut self.queue.lock().unwrap(), item, name, true);
     }
 }
 
@@ -1176,16 +1243,29 @@ async fn pass(ar: &Archiver, app: &AppHandle, st: &Arc<AppState>, rs: &RemoteSta
     ar.emit(true);
     let Some(peer) = peer else { return false };
     // Manual queue first, then (auto) candidates; skip busy and recently failed ones.
-    let failed_recently = |i: &Item| ar.failed.lock().unwrap().get(i).is_some_and(|t| t.elapsed() < RETRY_AFTER);
-    let manual: Vec<Item> = ar.queue.lock().unwrap().iter().filter(|e| e.state == "queued").map(|e| e.item.clone()).collect();
-    let mut next = manual.into_iter().find(|i| !busy(app, st, i));
-    if next.is_none() && archive_auto_setting() {
-        next = auto_candidates(st).into_iter().find(|i| !failed_recently(i) && !busy(app, st, i));
-        if let Some(i) = &next {
-            ar.enqueue(i.clone(), display_name(st, i));
+    let auto = archive_auto_setting();
+    q_prune(&mut ar.queue.lock().unwrap(), auto);
+    if auto {
+        let retry_ok = |i: &Item| ar.failed.lock().unwrap().get(i).is_none_or(|t| t.elapsed() >= RETRY_AFTER);
+        let cands: Vec<(Item, String)> = auto_candidates(st).into_iter().map(|i| (i.clone(), display_name(st, &i))).collect();
+        q_sync_auto(&mut ar.queue.lock().unwrap(), &cands, retry_ok);
+    }
+    let next = {
+        let q = ar.queue.lock().unwrap().clone();
+        q_next(&q, |i| busy(app, st, i))
+    };
+    let Some(item) = next else {
+        ar.emit(true);
+        return false;
+    };
+    // The in-flight item leads the list.
+    {
+        let mut q = ar.queue.lock().unwrap();
+        if let Some(i) = q.iter().position(|e| e.item == item) {
+            let e = q.remove(i);
+            q.insert(0, e);
         }
     }
-    let Some(item) = next else { return false };
     ar.update(&item, |e| {
         e.state = "moving".into();
         e.error = None;
@@ -1200,14 +1280,23 @@ async fn pass(ar: &Archiver, app: &AppHandle, st: &Arc<AppState>, rs: &RemoteSta
         ar.emit(true);
     };
     let progress = |done: u64| {
-        ar.update(&item, |e| e.bytes_done = done);
+        ar.update(&item, |e| {
+            e.bytes_done = done;
+            // All bytes sent: the receiver now checks sizes + SHA-256 and places them.
+            if e.bytes_total > 0 && done >= e.bytes_total {
+                e.state = "verifying".into();
+            }
+        });
         ar.emit(false);
     };
     let r = move_one(&ar.http, &peer, &src, &item, &on_start, &progress).await;
     match r {
         Ok(()) => {
             tracing::info!(?item, "archive: moved");
-            ar.queue.lock().unwrap().retain(|e| e.item != item);
+            ar.update(&item, |e| {
+                e.state = "done".into();
+                e.done_at = Some(Instant::now());
+            });
             ar.failed.lock().unwrap().remove(&item);
             crate::sync::touch();
             let _ = app.emit("sync-updated", json!({ "what": ["library"] }));
@@ -1218,9 +1307,17 @@ async fn pass(ar: &Archiver, app: &AppHandle, st: &Arc<AppState>, rs: &RemoteSta
             tracing::warn!(?item, "archive move failed: {e}");
             ar.failed.lock().unwrap().insert(item.clone(), Instant::now());
             ar.update(&item, |q| {
-                q.state = "failed".into();
+                q.state = "error".into();
                 q.error = Some(e);
             });
+            // Out of the way of what is still queued.
+            {
+                let mut q = ar.queue.lock().unwrap();
+                if let Some(i) = q.iter().position(|x| x.item == item) {
+                    let x = q.remove(i);
+                    q.push(x);
+                }
+            }
             ar.emit(true);
             false
         }
@@ -1366,13 +1463,14 @@ pub fn archive_move(app: AppHandle, ar: Ar<'_>, key: Option<String>, yt_id: Opti
         }
     }
     ar.failed.lock().unwrap().remove(&item);
-    ar.enqueue(item.clone(), display_name(&st, &item));
+    ar.enqueue_front(item.clone(), display_name(&st, &item));
     ar.wake.notify_one();
     ar.emit(true);
     Ok(ar.status())
 }
 
-/// `{queue: [{kind, key|id, name, bytes_done, bytes_total, state, error}], device, auto}`.
+/// `{queue: [{kind, key|id, name, bytes_done, bytes_total, state, error}], device, auto}`;
+/// queue in move order (in-flight first), state queued|moving|verifying|done|error.
 #[tauri::command]
 pub fn archive_status(ar: Ar<'_>) -> Result<Value, String> {
     Ok(ar.status())
@@ -1771,6 +1869,45 @@ mod tests {
         // Moving it again is a no-op ("already").
         let b = post(&http_client(), &r.peer, "/v1/archive/begin", &serde_json::to_value(&p.req).unwrap(), Duration::from_secs(10)).await.unwrap();
         assert_eq!(b["already"], json!(true));
+    }
+
+    #[test]
+    fn archive_queue_manual_pick_goes_next() {
+        let t = |k: &str| Item::Torrent { key: k.repeat(40) };
+        let names = |q: &[QEntry]| q.iter().map(|e| (e.item.clone(), e.state.clone())).collect::<Vec<_>>();
+        let mut q = Vec::new();
+        let cands: Vec<(Item, String)> = ["a", "b", "c", "d"].iter().map(|k| (t(k), k.to_string())).collect();
+        q_sync_auto(&mut q, &cands, |_| true);
+        assert_eq!(q.len(), 4);
+        q[0].state = "moving".into();
+        // Manual pick of "d": right after the in-flight "a", ahead of b and c.
+        q_enqueue(&mut q, t("d"), "d".into(), true);
+        let order: Vec<Item> = q.iter().map(|e| e.item.clone()).collect();
+        assert_eq!(order, vec![t("a"), t("d"), t("b"), t("c")]);
+        assert_eq!(q[0].state, "moving", "in-flight transfer untouched");
+        assert_eq!(q_next(&q, |_| false), Some(t("d")));
+        // Re-syncing auto keeps the manual position; a vanished candidate is dropped.
+        q_sync_auto(&mut q, &cands[..2], |_| true);
+        assert_eq!(names(&q).into_iter().map(|x| x.0).collect::<Vec<_>>(), vec![t("a"), t("d"), t("b")]);
+        // Verifying also counts as in flight; an errored item re-queued by hand goes next.
+        q[0].state = "verifying".into();
+        q.push(q_entry(t("e"), "e".into(), false));
+        q[3].state = "error".into();
+        q_enqueue(&mut q, t("e"), "e".into(), true);
+        assert_eq!(q[1].item, t("e"));
+        assert_eq!(q[1].state, "queued");
+        // Busy items are skipped; enqueueing the in-flight item is a no-op.
+        assert_eq!(q_next(&q, |i| i == &t("e")), Some(t("d")));
+        q_enqueue(&mut q, t("a"), "a".into(), true);
+        assert_eq!(q[0].item, t("a"));
+        assert_eq!(q[0].state, "verifying");
+        // Auto off: waiting auto entries go, manual ones stay; stale done entries go.
+        q[0].state = "done".into();
+        q[0].done_at = Some(Instant::now() - DONE_SHOW);
+        q_prune(&mut q, false);
+        assert_eq!(names(&q), vec![(t("e"), "queued".into()), (t("d"), "queued".into())]);
+        let s = serde_json::to_value(&q[0]).unwrap();
+        assert!(s.get("manual").is_none() && s.get("done_at").is_none());
     }
 
     #[test]
